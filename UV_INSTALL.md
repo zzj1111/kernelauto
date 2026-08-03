@@ -80,18 +80,38 @@ uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
 # rest of the pinned stack
 uv pip install -r requirements-uv.txt
 
-# flash-attn: this exact build is a local wheel, not on PyPI. Two options:
-#   (a) copy the wheel from the source machine (fast, ~2 min):
-#       source: /home/zha00175/CudaForge_plus/verl/flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
-#       uv pip install /path/to/flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
-#   (b) rebuild from source (slow, 30-60+ min, needs the CUDA toolkit from step 1 on PATH):
-#       uv pip install flash-attn==2.8.1 --no-build-isolation
+# flash-attn: NOT a compile-from-source step and NOT something you need to copy off the
+# source machine — verl's own scripts/install_vllm_sglang_mcore.sh gets it the same way:
+# the official prebuilt wheel from the flash-attention GitHub release.
+wget -nv https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+uv pip install flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+# (the source machine happens to have this cached at
+#  /home/zha00175/CudaForge_plus/verl/flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl
+#  if the target has no internet egress — copy that file instead of wget'ing.)
 
 # the repo IS the verl package (pyproject.toml name="verl") — install it editable so
 # cudascaffold's `python -m cudascaffold.run_arm` (which imports verl via cwd) and any
-# direct `import verl` both resolve here, not to some other verl checkout on the box
-uv pip install -e .
+# direct `import verl` both resolve here, not to some other verl checkout on the box.
+# --no-deps matters: setup.py's own install_requires pins "numpy<2.0.0" (stale — the
+# verified-working combo above needs numpy==2.2.6 for vllm 0.11.0/torch 2.8), and a
+# plain `uv pip install -e .` will silently re-resolve and DOWNGRADE numpy to 1.26.4.
+# Confirmed by actually running this: without --no-deps, numpy 2.2.6 -> 1.26.4.
+uv pip install -e . --no-deps
 ```
+
+Verified end-to-end on 2026-08-03 in a scratch venv (not the live training one): `torch`,
+`flash_attn`, `verl` (editable from this repo), `vllm`, and `cudascaffold` (all submodules —
+`scaffold`, `adapters`, `gates`, `loop`, `observation`, `teacher`, `run_arm`) all import cleanly,
+`torch.cuda.is_available()` is `True`, and `cudaforge/reward_bench_rubric.py` loads the same way
+verl loads it (`importlib.util.spec_from_file_location`, not a package import) and exposes
+`compute_score`. Not verified: an actual training step (would contend for GPUs with the live
+run) and the rubric judge server end-to-end.
+
+One more thing this run surfaced: installing into a venv that lives on the NFS mount
+(`/mnt/data1`) makes even plain `import torch` noticeably slow (tens of seconds — Python import
+opens many small files, and NFS per-file latency adds up) versus local disk. Not fatal, but if
+the target server's import/compile times feel sluggish, check whether the venv is on network
+storage before assuming something's actually broken.
 
 Note on the source venv: the pip metadata there shows `verl` editable-installed from a
 *different* directory (`/home/zha00175/verl_clean`, a separate fork with its own divergent

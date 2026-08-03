@@ -40,14 +40,14 @@ ninja==1.13.0
 
 # --- rollout backend (StitchCUDA launches with actor_rollout_ref.rollout.name=vllm) ---
 vllm==0.11.0
+flashinfer-python==0.3.1
 fastapi==0.124.0
 uvicorn==0.38.0
 
 # --- cudascaffold Teacher (GPT controller calls) ---
 openai==1.99.1
 
-# --- flash-attn: custom local wheel, NOT on PyPI in this exact build ---
-# Built for: cp312, torch 2.8, cu12, cxx11abiFALSE. Either copy the wheel file itself
-# (fastest — see UV_INSTALL.md) or rebuild from source once torch is installed:
-#   uv pip install flash-attn==2.8.1 --no-build-isolation
-# flash_attn==2.8.1
+# --- flash-attn: not a plain PyPI package for this build (cp312, torch2.8, cu12,
+# cxx11abiFALSE) — it's the official prebuilt wheel from the flash-attention GitHub
+# release page. See UV_INSTALL.md for the exact command; do not `uv pip install flash-attn`
+# directly, it will try to compile from source (slow, and can pick the wrong ABI).
