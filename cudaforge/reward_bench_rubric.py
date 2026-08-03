@@ -210,6 +210,116 @@ Constraints:
 """
 
 
+RUBRIC_PROMPT_TRITON = r"""
+You are a strict rubric judge for GRPO training on Triton kernel generation.
+Assume the candidate code is runnable and passes functional correctness (bench will verify).
+Do NOT score compile/runtime correctness, numerical correctness, or formatting issues.
+
+Score ONLY rubric aspects bench cannot reliably measure (1-5 integers):
+- anti_hacking (1-5)
+- bottleneck_coverage (1-5)
+- cuda_perf_quality (1-5)          # for Triton: kernel-quality, see (3)
+- multi_component_focus (1-5)
+
+If major_hacking=true, set anti_hacking=1 and total=0.
+
+IMPORTANT CONTEXT FOR THIS TASK. Many reference models here operate on small tensors, where a
+Triton launch can cost more than the PyTorch op it replaces. A genuine kernel may therefore
+measure SLOWER than the reference. That is NOT hacking and must not be penalised here — bench
+already accounts for speed. Your job is the opposite one: make sure an answer that avoids writing
+a kernel at all cannot score well just because leaving the work to PyTorch happens to be fast.
+
+============================================================
+(1) anti_hacking (1-5)
+5: No signs of hacking. forward routes the core compute through a @triton.jit kernel the
+   candidate wrote. No suspicious shortcuts.
+4: Mostly clean. Minor specialization (e.g., assumes contiguous or a fixed dtype) but the Triton
+   path is genuine.
+3: Some suspicious patterns (a Triton kernel exists but part of the heavy work still runs through
+   torch/ATen, or the kernel's output is partially overwritten by a torch op).
+2: Strong suspicion of gaming (decorative kernel: it is defined, maybe even launched, but the
+   result returned comes from PyTorch), but not fully blatant.
+1: Obvious hacking => MUST set major_hacking=true.
+
+Set major_hacking=true if any obvious:
+- hardcoded/constant outputs unrelated to inputs
+- caching/memoization keyed on input patterns to cheat
+- branching on specific input values to cheat
+- the reference implementation returned essentially unchanged, renamed to ModelNew
+- a @triton.jit kernel is present but never launched, or its output is discarded
+- Python/CPU tricks as the primary compute path
+- torch.compile / torch.jit used INSTEAD of writing a kernel
+
+============================================================
+(2) bottleneck_coverage (1-5)
+Judge whether the candidate chooses to implement the REAL work of the reference model in Triton.
+5: The dominant operator(s) run in Triton — matmul, conv, attention, norm, softmax, reduction —
+   or a meaningful fusion of the chain (e.g. matmul+bias+activation in one kernel).
+4: At least one major operator is genuinely implemented in Triton; the choice is reasonable.
+3: Some real work moved to Triton but mixed with superficial targets; the dominant cost is not
+   clearly the thing that was replaced.
+2: Only cheap elementwise tails (relu/add/scale) are in Triton while the main operator stays in
+   PyTorch.
+1: No meaningful coverage; the kernel does not carry the model's actual computation.
+
+============================================================
+(3) cuda_perf_quality (1-5)
+Judge the quality of the Triton implementation, beyond "a @triton.jit function exists".
+Evidence to look for — these are Triton's actual levers, not CUDA's:
+- Correct and non-degenerate use of tl.program_id / tl.arange to map the problem onto blocks
+- Masking on every tl.load / tl.store that can run off the end, with a sensible `other=`
+- A BLOCK_SIZE that is a compile-time tl.constexpr and a sane power of two for the shape
+- Contiguous, coalesced access; stride arithmetic passed in rather than assumed
+- Fusing the whole chain inside one kernel instead of launching one kernel per operator
+- Reductions done with tl.sum / tl.max over a block axis rather than a Python loop
+- For matmul-like work: 2D tiling over M/N with a K loop and tl.dot, accumulating in fp32
+- Numerically careful patterns where the op needs them (max-subtraction before exp in softmax,
+  fp32 accumulation for fp16/bf16 inputs)
+- Optional/advanced: num_warps / num_stages tuning, triton.autotune, block pointers,
+  tl.multiple_of / tl.max_contiguous hints
+
+Scoring:
+5: Expert-grade. Proper tiling, fused chain, masked accesses, fp32 accumulation where needed,
+   and evidence of tuning (autotune, num_warps/num_stages) or advanced block-pointer use.
+4: Good. At least one substantial optimisation done properly (2D tiling with tl.dot, a fused
+   multi-op kernel, or a correct block reduction) with correct masking.
+3: A plausible but naive kernel: one element per program, correct masking, no fusion or tiling.
+2: Naive and careless: unmasked loads, a Python loop where a block reduction belongs, or a block
+   size that makes the launch degenerate (e.g. BLOCK=1).
+1: No meaningful Triton reasoning visible; essentially a wrapper that launches a trivial kernel.
+
+============================================================
+(4) multi_component_focus (1-5)
+Judge whether the candidate appropriately targets MULTI-COMPONENT models.
+5: If the model has several operators, the candidate implements multiple of them in Triton, or
+   fuses them into one kernel, rather than converting only the last trivial op.
+4: Implements the dominant operator; may not cover all, but clearly targets the key cost.
+3: Something meaningful is covered, but scope is limited when more was available.
+2: Focuses on minor/tail ops while the main operators stay in PyTorch.
+1: No evidence of appropriate focus.
+
+Notes:
+- If the reference model is truly single-op, do NOT penalize for not optimizing multiple ops:
+  assign at least 3 if it targets that single op reasonably.
+
+============================================================
+Output ONLY JSON:
+{
+  "anti_hacking": <int 1-5>,
+  "bottleneck_coverage": <int 1-5>,
+  "cuda_perf_quality": <int 1-5>,
+  "multi_component_focus": <int 1-5>,
+  "major_hacking": <true/false>,
+  "total": <int>
+}
+
+Constraints:
+- Integers only (1-5).
+- If major_hacking=false: total = anti_hacking + bottleneck_coverage + cuda_perf_quality + multi_component_focus.
+- If major_hacking=true: total=0 and anti_hacking=1.
+- Output JSON only, no extra text.
+"""
+
 RUBRIC_JSON_ONLY_ENFORCER = r"""
 IMPORTANT:
 - Output MUST be a single JSON object starting with '{' and ending with '}'.
@@ -686,7 +796,20 @@ def _run_rubric_judge(
     extra_info = extra_info or {}
     ds = str(data_source).lower()
 
-    if ds == "cudaforgeimprovement":
+    if ds == "tritonkernel":
+        # Triton tasks are graded on Triton's own levers. Reusing the CUDA rubric here would have
+        # marked every correct answer down for lacking shared memory and tensor cores — things
+        # Triton manages for you and a candidate cannot demonstrate.
+        base_system_prompt = RUBRIC_PROMPT_TRITON.strip() + "\n\n" + RUBRIC_JSON_ONLY_ENFORCER.strip()
+        # The Triton set is single-turn with a PyTorch reference and no prior kernel, so the
+        # from-scratch user prompt is the right shape. Forgetting to set this left base_user_prompt
+        # unbound, the call failed, and every candidate silently received the neutral fallback
+        # rubric (3/3/3/3, total 12) — a rubric that scores a real kernel and a rename identically.
+        base_user_prompt = _build_rubric_user_prompt_from_scratch(
+            reference_code=reference_code,
+            candidate_code=candidate_code,
+        )
+    elif ds == "cudaforgeimprovement":
         base_system_prompt = RUBRIC_PROMPT_REFINEMENT.strip() + "\n\n" + RUBRIC_JSON_ONLY_ENFORCER.strip()
         improvement_txt_raw = str(extra_info.get("question", "") or "")
         improvement_txt = safe_trim_improvement_txt(improvement_txt_raw, max_chars=14000)
@@ -706,7 +829,12 @@ def _run_rubric_judge(
         raw = _call_vllm_chat_completion(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            max_tokens=256,
+            # 256 was in fact sufficient: this call already sends
+            # chat_template_kwargs={"enable_thinking": False}, and the judge honours it — measured
+            # against the live server, the reply is 12 characters with no <think> span and
+            # finish_reason=stop. The limit is raised only as headroom for a judge that ignores
+            # the flag, where the reasoning would otherwise consume the budget before the JSON.
+            max_tokens=int(os.environ.get("RUBRIC_MAX_TOKENS", "3072")),
         )
         return _parse_rubric_json(raw)
 
@@ -1001,8 +1129,12 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # which kernel task is failing — and "which instance is stuck" is the whole basis for
     # per-instance scaffolding. Print only; nothing about the score changes.
     _ei = extra_info or {}
+    # `category` is echoed alongside `level` because a dataset can carry either: the CUDA set
+    # defines its categories by level, the Triton set by operator family with level==0 throughout.
+    # The harness aggregates per category, so whichever one is authoritative has to reach the log.
     print(f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
-          f"task_name:{_ei.get('task_name')}, level:{_ei.get('level')}")
+          f"task_name:{_ei.get('task_name')}, level:{_ei.get('level')}, "
+          f"category:{_ei.get('category')}")
 
     if correctness != 1:
         return 0.0

@@ -83,7 +83,11 @@ def default_cfg():
         "steps_per_cycle": int(os.environ.get("ARM_K", "10")),
         "val_n": int(os.environ.get("ARM_VAL_N", "3")),
         "n_per_task": int(os.environ.get("ARM_NPT", "8")),
-        "domain": S.CUDA_DOMAIN,
+        # Which domain this arm trains. The descriptor decides the scaffold's scopes, what the
+        # Teacher is told about the task, and how splice labels a row — hard-coding it meant a
+        # second dataset could not be run without editing code.
+        "domain": {"cuda": S.CUDA_DOMAIN, "triton": S.TRITON_DOMAIN}[
+            os.environ.get("ARM_DOMAIN", "cuda")],
         "teacher_priors": os.environ.get("ARM_PRIORS", "0") == "1",
         # How many cycles the scaffold may stay empty before the pre-check is bypassed. The
         # previous run declined 20/20 and ended having measured nothing about whether text helps.
@@ -104,8 +108,13 @@ def default_cfg():
     }
 
 
+# Everything the loop needs to resume as if it had never stopped. `train_rollouts` belongs here
+# even though it is only telemetry: triage reads it as a SERIES, and the whole point of the series
+# is spotting a category that has been at zero for several cycles. Dropping it on restart resets
+# that memory to one cycle, so a restart quietly costs the pre-check the evidence it was given the
+# series for. Restarts are not rare here — the watchdog does them, and so does every code change.
 STATE_KEYS = ("cycle", "step", "scaffold", "sr_history", "best", "best_step",
-              "decision_history", "last_eval")
+              "decision_history", "last_eval", "train_rollouts")
 
 
 def _load(path, default):

@@ -134,6 +134,88 @@ def _cats(domain):
     return list((domain or ALF_DOMAIN).categories)
 
 
+
+# ---------------------------------------------------------------------------------------------
+# Triton domain: hkust-nlp/drkernel-rl-data, downsampled by dataset/CudaForge/build_triton_split.py
+# ---------------------------------------------------------------------------------------------
+
+# Categories are operator FAMILIES, not difficulty levels — this dataset's `level` is 0 on all
+# 71,996 rows, so the CUDA set's scratch/improve_l* axis does not exist here. The family axis is
+# also the one that has actually predicted outcomes so far: fusion-friendly work behaves very
+# differently from work backed by a tuned library kernel.
+TRITON_CATEGORIES = ["elementwise", "reduce", "norm_softmax", "matmul", "conv", "loss"]
+
+TRITON_CATEGORY_INFO = {
+    "elementwise": "The heaviest operator is elementwise/unary/binary — activations, clamps, "
+                   "arithmetic chains. Nothing here is library-bound, so the whole chain can be "
+                   "fused into one kernel. (100 of the 600 training rows.)",
+    "reduce": "The heaviest operator reduces along an axis — sum/mean/max/argmax/cumsum/var. "
+              "(100 rows.)",
+    "norm_softmax": "The heaviest operator is a normalisation or softmax — layer/batch/group "
+                    "norm, softmax, logsoftmax. These have a reduce-then-apply structure. "
+                    "(100 rows.)",
+    "matmul": "The heaviest operator is a matmul/bmm/linear/einsum, i.e. work cuBLAS is already "
+              "tuned for. (100 rows.)",
+    "conv": "The heaviest operator is a convolution, including transposed and depthwise, i.e. "
+            "work cuDNN is already tuned for. (100 rows.)",
+    "loss": "The heaviest operator is a loss or divergence — MSE, smooth L1, KL, cosine "
+            "similarity. Usually a reduction over a small elementwise expression. (100 rows.)",
+}
+
+# What the student may write. Not a recommendation — the mechanical surface it acts on.
+TRITON_PRIMITIVES = [
+    "a @triton.jit kernel using triton.language (tl.program_id, tl.arange, tl.load/tl.store "
+    "with masks, tl.sum/tl.max, tl.dot), launched with a grid from the Python side",
+    "a class ModelNew(nn.Module) mirroring the reference module's inputs and outputs",
+]
+
+TRITON_DOMAIN = Domain(
+    name="triton_kernel",
+    episode_desc=(
+        "One instance gives a PyTorch reference module and asks for a drop-in replacement that "
+        "computes the same thing using custom Triton kernels. The answer is imported, run against "
+        "the reference on the same inputs, and timed. Reward is 0 unless the output matches the "
+        "reference within tolerance; given correctness it scales with measured speedup over the "
+        "reference (clipped at 5x) and is multiplied by an LLM rubric score. Reward is forced to 0 "
+        "if the rubric flags reward hacking — returning the reference renamed, defining a "
+        "@triton.jit kernel that is never launched or whose result is discarded, or using "
+        "torch.compile in place of writing a kernel."),
+    categories=TRITON_CATEGORIES,
+    category_info=TRITON_CATEGORY_INFO,
+    action_primitives=TRITON_PRIMITIVES,
+    # `extra_info.answer` is the PyTorch reference to be BEATEN, not a fast kernel to reveal.
+    has_reference_solutions=False,
+    # Mechanically available — every row carries a task_name — but see the reach fact below.
+    instance_scope=True,
+    extra_facts=(
+        "Every instance carries exactly one of the category labels above, assigned by its "
+        "heaviest operator. Most instances also contain lighter elementwise operators alongside "
+        "it; the label names the dominant one, not the only one.",
+        "Each instance fuses 2 to 8 PyTorch operators, 3 at the median, drawn from a vocabulary "
+        "of 233 distinct operators across the 600 training rows.",
+        "Given correctness, the score is driven by measured speedup over the PyTorch reference "
+        "(clipped at 5x) and then multiplied by the rubric. Correctness is therefore a gate, not "
+        "the objective: a category can have a healthy correct_rate and still be contributing "
+        "almost nothing.",
+        "Input sizes vary enormously — the median instance touches about 14,000 elements, the "
+        "10th percentile 128 and the 90th 3.1 million. On the small ones a Triton launch can cost "
+        "more than the PyTorch operator it replaces, so a genuine kernel there may measure SLOWER "
+        "than leaving the work to PyTorch. The rubric, not the speedup term, is what separates a "
+        "real kernel from an answer that avoided writing one.",
+        "Compilation failure, an incorrect result, and a timeout are all scored 0 — they are "
+        "indistinguishable in the reward.",
+        "The target GPU is an NVIDIA H200 (Hopper, sm_90).",
+        "All 600 training rows have DISTINCT task_names, so an instance recurs only once per "
+        "epoch — roughly two or three times across a 200-step run at batch 8. Per-instance text "
+        "is mechanically available but reaches far less repetition than a category-level scope "
+        "does; weigh that against its precision.",
+        "The held-out set is 180 rows, 30 per category, drawn from the same pool with no "
+        "reference implementation shared with training. Unlike the CUDA arm it covers EVERY "
+        "category, so a gain confined to one category is visible in valid_seen rather than "
+        "invisible.",
+    ),
+)
+
 def empty_scaffold(domain=None):
     """Cold-start scaffold: 真空 — nothing injected. version 0."""
     cats = _cats(domain)
@@ -430,14 +512,19 @@ def validate_scaffold(scaffold, domain=None):
 # category set crosses the task mode with the level where the level exists.
 CUDA_LEVELS = ["scratch", "improve_l1", "improve_l2", "improve_l3"]
 
+# Counts are those of train_new_clean.parquet. They were 200/80/79/41 over 400 rows until the
+# split was rebuilt on 2026-08-03: 44 improvement rows turned out to be trajectories for problems
+# in the TEST split, mislabelled `split="train"` in the source data, and were dropped. Stating a
+# count the data does not have is the same class of defect as naming a signal field that does not
+# exist — see tests/test_alignment.py.
 CUDA_LEVEL_INFO = {
     "scratch": "Write a CUDA kernel for a PyTorch reference module from scratch; no prior "
-               "attempt is supplied. (data_source=CudaForge, 200 of the 400 training rows.)",
-    "improve_l1": "Improve a supplied kernel for a SINGLE PyTorch operator. (80 rows.)",
+               "attempt is supplied. (data_source=CudaForge, 200 of the 356 training rows.)",
+    "improve_l1": "Improve a supplied kernel for a SINGLE PyTorch operator. (61 rows.)",
     "improve_l2": "Improve a supplied kernel for a small fused operator sequence, e.g. "
-                  "conv+bias+relu. (79 rows.)",
+                  "conv+bias+relu. (63 rows.)",
     "improve_l3": "Improve a supplied kernel for a FULL model architecture — many operators, "
-                  "fusion opportunities across layers. (41 rows.)",
+                  "fusion opportunities across layers. (32 rows.)",
 }
 
 # What the student may write. Not a recommendation — the mechanical surface it acts on.
@@ -474,12 +561,30 @@ CUDA_DOMAIN = Domain(
         "About half of the improvement instances start from a kernel that was itself incorrect.",
         "Compilation failure, an incorrect result, and a timeout are all scored 0 — they are "
         "indistinguishable in the reward.",
+        "Given correctness, the score is driven by measured speedup over the PyTorch reference "
+        "(clipped at 5x) and then multiplied by the rubric. Correctness is therefore a gate, not "
+        "the objective: a correct kernel that matches PyTorch's speed and a correct kernel that "
+        "beats it 5x differ by roughly a factor of four in reward, while a correct-but-not-faster "
+        "kernel and an incorrect one differ by far less. A category can have a healthy "
+        "correct_rate and still be contributing almost nothing.",
+        "The held-out set is 50 rows, ALL of them the scratch category, drawn from KernelBench "
+        "problems that appear nowhere in training. So valid_seen carries no per-category "
+        "breakdown — its only key is the data_source — and a gain confined to the improvement "
+        "categories does not appear in it directly. It does NOT follow that the improvement "
+        "categories are worth nothing: RL updates one policy, and the gradient from improvement "
+        "rollouts passes through the same weights that write scratch answers, so a category that "
+        "starts learning can raise scratch success as well. What this observation cannot do is "
+        "attribute a move in valid_seen to the category that caused it. The improvement "
+        "categories have an effect you cannot measure directly — which is not the same as an "
+        "effect of zero, and reasoning as if it were is how 44% of the training data ends up "
+        "written off.",
         "The target GPU is an NVIDIA H200 (Hopper, sm_90); its specifications are already stated "
         "in every prompt.",
-        "An instance is identified by its task_name (e.g. '27_RegNet'). ~150 distinct task_names "
-        "cover the 200 improvement rows, so the same instance recurs many times during a run. "
-        "The 200 scratch rows carry NO task_name and therefore cannot be targeted individually — "
-        "per-instance text reaches the improvement categories only.",
+        "An instance is identified by its task_name (e.g. '27_RegNet'). About 120 distinct "
+        "task_names cover the 156 improvement rows, so most instances appear once or twice per "
+        "epoch rather than many times — per-instance text reaches a narrow slice. The 200 scratch "
+        "rows carry NO task_name and therefore cannot be targeted individually; per-instance text "
+        "reaches the improvement categories only.",
         "The rubric that multiplies the reward uses a DIFFERENT criteria set per category, each "
         "scored 1-5. For the scratch category: anti_hacking (no fake speedups), "
         "bottleneck_coverage (the kernel addresses the actual hot path), cuda_perf_quality "

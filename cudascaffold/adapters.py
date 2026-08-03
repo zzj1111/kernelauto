@@ -292,9 +292,10 @@ def eval_adapter(checkpoint, val_n, cfg):
             "n_draws": len(draws), "n_draws_requested": val_n}
 
 
+# `category:` is optional so logs written before it was echoed still parse.
 REWARD_LINE = re.compile(
     r"correctness:\s*(\d+),\s*speedup:\s*([0-9.eE+-]+),\s*data_source:(\S+?),\s*"
-    r"task_name:(\S+?),\s*level:(\S+)")
+    r"task_name:(\S+?),\s*level:([^,\s]+)(?:,\s*category:(\S+))?")
 
 
 def worker_log_offsets(cfg):
@@ -360,7 +361,7 @@ def per_instance_from_log(logpath=None, limit=40, offsets=None, cfg=None):
             return {}, []
     agg = {}
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, task, level = m.groups()
+        correct, speedup, _ds, task, level, _category = m.groups()
         if task in ("None", ""):
             continue
         a = agg.setdefault(task, {"n": 0, "n_correct": 0, "speedups": [], "level": level})
@@ -382,9 +383,16 @@ def per_instance_from_log(logpath=None, limit=40, offsets=None, cfg=None):
     return out, [{"instance": t, **out[t]} for t in failures]
 
 
-def cat_of_level(level):
-    """Scaffold category from the `level:` field the reward prints. Mirrors splice.level_of,
-    which works off extra_info; this one works off the already-stringified log field."""
+def cat_of_level(level, category=None):
+    """Scaffold category for one reward line. Mirrors splice.level_of: an explicit `category`
+    wins, and only when absent is the label derived from `level`.
+
+    Both are needed because the two datasets define categories differently — the CUDA set by
+    level, the Triton set by operator family with level==0 on every row. Deriving from level
+    there yields "improve_l0", which belongs to no domain, so every candidate would be dropped
+    from the per-category aggregate and the Teacher would see an empty breakdown."""
+    if isinstance(category, str) and category.strip() and category.strip() not in ("None", "nan"):
+        return category.strip()
     s = str(level).strip()
     if s in ("None", "", "nan", "NaN"):
         return "scratch"
@@ -416,8 +424,8 @@ def per_category_from_log(offsets):
     txt = _read_since(offsets)
     agg = {}
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, _task, level = m.groups()
-        cat = cat_of_level(level)
+        correct, speedup, _ds, _task, level, category = m.groups()
+        cat = cat_of_level(level, category)
         if cat is None:
             continue
         a = agg.setdefault(cat, {"n": 0, "n_correct": 0, "speedups": []})
@@ -546,7 +554,17 @@ def signals_adapter(checkpoint, scaffold, cfg, seed):
 
 
 def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
-    """Paired three-way A/B: bare vs the live scaffold vs the proposal, same rows, same seed."""
+    """Paired three-way A/B: bare vs the live scaffold vs the proposal, same rows, same seed.
+
+    Scored per CATEGORY from the reward's own prints, for the same reason signals_adapter is:
+    verl aggregates validation by `data_source`, and neither dataset's data_sources line up with
+    the scaffold's categories — the Triton set has exactly one. The previous version asked
+    `per.get(task, overall_avg)` and, finding no matching key, silently handed ab_gate the OVERALL
+    mean for every touched category. A proposal editing one of six categories was then judged on
+    a mean where five sixths of the rows could not have changed, using the shaped reward, whose
+    speedup term is heavy-tailed enough to have produced a -0.72 "gap" between two byte-identical
+    prompt sets. Both the dilution and the metric are fixed here.
+    """
     from . import splice as SP
 
     step = int(str(checkpoint).rstrip("/").split("global_step_")[-1])
@@ -558,11 +576,14 @@ def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
                             ("candidate", candidate, "force")):
         pq = os.path.join(cfg["work"], f"ab_s{step}_{tag}.parquet")
         SP.build(base, pq, scaf, seed=seed, mode=mode)
-        avg, per = _measure_pass(checkpoint, pq, f"ab_{tag}", cfg, seed)
-        # ab_gate consumes {task: (rate, n)}; restrict to the categories the proposal touched so
-        # an edit to one category is not judged by the categories it never changed.
-        out[tag] = {t: (per.get(t, avg if avg is not None else 0.0), cfg["n_per_task"])
-                    for t in (tasks or per.keys())}
+        off = worker_log_offsets(cfg)
+        _measure_pass(checkpoint, pq, f"ab_{tag}", cfg, seed)
+        by_cat = per_category_from_log(off)
+        # ab_gate consumes {task: (rate, n)} and aggregates n-weighted over the touched tasks, so
+        # a category with no rows in this pass must be ABSENT rather than present with a made-up
+        # rate: absent contributes nothing, present at 0.0 would count as a measured failure.
+        keys = tasks or list(by_cat)
+        out[tag] = {t: (by_cat[t]["correct_rate"], by_cat[t]["n"]) for t in keys if t in by_cat}
     return out
 
 

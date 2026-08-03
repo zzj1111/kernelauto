@@ -17,9 +17,21 @@ import os
 
 _MARK_OPEN = "[STRATEGY — injected during training only]"
 _MARK_CLOSE = "[END STRATEGY]"
-# Splice ahead of the block that tells the model what to emit, so the guidance is read before
-# the output contract rather than after it.
-_ANCHOR = "OUTPUT RULES (STRICT)"
+# Splice ahead of the block that tells the model what to emit, so the guidance is read before the
+# output contract rather than after it. Which phrase opens that block depends on the dataset, so
+# the anchors are tried in order and the first one present wins.
+#
+# A single hard-coded anchor is not safe here: splice() falls back to appending at the END of the
+# prompt when the anchor is missing, which does not fail loudly. Pointing the CUDA anchor at the
+# Triton set put every injected block after "Let's think step by step." — still in the prompt, but
+# after the instruction it was meant to qualify, and nothing reported anything wrong.
+#
+# "Optimize the architecture named" is deliberately the invariant PREFIX: the class name varies
+# (Model, TripleMarginLoss, ...), so the full sentence misses rows.
+_ANCHORS = (
+    "OUTPUT RULES (STRICT)",              # CudaForge
+    "Optimize the architecture named",    # drkernel-rl-data (Triton)
+)
 
 
 def level_of(extra_info, data_source=None):
@@ -31,6 +43,13 @@ def level_of(extra_info, data_source=None):
     the data rather than half of it.
     """
     ei = _as_dict(extra_info)
+    # An explicit category wins over anything derived. The Triton set carries `category` directly
+    # and has level==0 on every row, so deriving from level there produced "improve_l0" — a label
+    # in no domain's category list, which meant splice() matched nothing and the scaffold was
+    # never injected at all. Silently: no error, no injected rows, every cycle.
+    cat = ei.get("category")
+    if isinstance(cat, str) and cat.strip():
+        return cat.strip()
     lv = ei.get("level")
     if lv is None:
         # No level => from-scratch. Confirm with data_source when the caller has it, so a future
@@ -86,8 +105,9 @@ def splice(prompt, block):
     if not block or not block.strip():
         return prompt
     wrapped = f"\n{_MARK_OPEN}\n{block.strip()}\n{_MARK_CLOSE}\n\n"
-    if _ANCHOR in prompt:
-        return prompt.replace(_ANCHOR, wrapped + _ANCHOR, 1)
+    for anchor in _ANCHORS:
+        if anchor in prompt:
+            return prompt.replace(anchor, wrapped + anchor, 1)
     return prompt.rstrip() + "\n" + wrapped
 
 
