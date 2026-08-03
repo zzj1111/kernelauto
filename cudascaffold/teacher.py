@@ -13,8 +13,9 @@ import os
 from . import observation as O
 from . import scaffold as S
 
-MODEL = "gpt-5.5"
-DEFAULT_KEY_FILE = "/mnt/data1/zha00175/tool-agent-secrets/openai.env"
+MODEL = os.environ.get("AUTOSCAFFOLD_TEACHER_MODEL", "gpt-5.5")
+DEFAULT_KEY_FILE = os.environ.get("AUTOSCAFFOLD_OPENAI_KEY_FILE",
+                                   "/mnt/data1/zha00175/tool-agent-secrets/openai.env")
 NOOP = {"diagnosis": "", "text_ops": [], "p_ops": []}
 
 

@@ -38,12 +38,15 @@ from . import scaffold as S
 from . import teacher as T
 from . import loop as L
 
-ROOT = "/mnt/data1/zha00175/StitchCUDA"
+# Auto-detects the repo checkout (this file lives at <repo>/cudascaffold/run_arm.py) so a
+# clone anywhere works with no edits; ARM_ROOT overrides explicitly if you need something else.
+ROOT = os.environ.get("ARM_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def default_cfg():
     exp = os.environ.get("ARM_EXP", "cuda_scaffold_8b")
-    root = f"/mnt/data1/zha00175/exp_cudaforge/{exp}"
+    exp_root = os.environ.get("ARM_EXP_ROOT", "/mnt/data1/zha00175/exp_cudaforge")
+    root = f"{exp_root}/{exp}"
     work = f"{root}/work"
     os.makedirs(work, exist_ok=True)
     return {
@@ -96,8 +99,9 @@ def default_cfg():
         "n_cycles": int(os.environ.get("ARM_N_CYCLES", "20")),
         "base_seed": 20260801,
         # --- paths ---
-        "ckpt_root": os.environ.get("ARM_CKPT",
-                                    f"/mnt/data1/zha00175/cuda_scaffold_ckpts/{exp}"),
+        "ckpt_root": os.environ.get(
+            "ARM_CKPT",
+            f"{os.environ.get('ARM_CKPT_ROOT', '/mnt/data1/zha00175/cuda_scaffold_ckpts')}/{exp}"),
         "work": work,
         "log_dir": f"{root}/logs",
         "scaffold_path": f"{root}/scaffold.json",

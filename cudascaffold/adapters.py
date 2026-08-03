@@ -17,16 +17,27 @@ import json
 import os
 import re
 import subprocess
+import sys
 
-ROOT = "/mnt/data1/zha00175/StitchCUDA"
-VENV_PY = ("/dev/shm/verl_env/bin/python"
-           if os.path.exists("/dev/shm/verl_env/bin/python")
-           else "/mnt/data1/zha00175/miniconda/envs/verl/bin/python")
+# All overridable via env var; every default below is what the source machine happens to use,
+# not a requirement. See UV_INSTALL.md / scripts/launch_autoscaffold.sh for how to set these on
+# a different box instead of editing this file.
+ROOT = os.environ.get("ARM_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Default: whatever python is running this process (correct as long as the launch script has
+# already activated the right venv / put it first on PATH). ARM_PYTHON overrides explicitly;
+# the /dev/shm-or-conda fallback is only there for the source machine's own historical setup.
+VENV_PY = os.environ.get("ARM_PYTHON") or (
+    "/dev/shm/verl_env/bin/python" if os.path.exists("/dev/shm/verl_env/bin/python")
+    else "/mnt/data1/zha00175/miniconda/envs/verl/bin/python" if
+    os.path.exists("/mnt/data1/zha00175/miniconda/envs/verl/bin/python")
+    else sys.executable)
 
 # Toolchain facts established by measurement, not assumption (see exp_cudaforge/DECISIONS.md):
-#   - /usr/bin/nvcc is CUDA 11.5 and cannot target sm_90; H200 needs 12.x.
+#   - the system default nvcc is often too old to target the GPU's compute capability.
 #   - torch looks for the ninja EXECUTABLE on PATH, so the venv's bin must be on it.
-CUDA_BIN = "/usr/local/cuda-12.9/bin"
+CUDA_HOME = os.environ.get("ARM_CUDA_HOME", "/usr/local/cuda-12.9")
+CUDA_BIN = os.environ.get("ARM_CUDA_BIN", f"{CUDA_HOME}/bin")
+TORCH_CUDA_ARCH_LIST = os.environ.get("ARM_TORCH_CUDA_ARCH_LIST", "9.0")
 VENV_BIN = os.path.dirname(VENV_PY)
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -46,8 +57,8 @@ def base_env(cfg):
     eval run and any ad-hoc probe cannot disagree about the toolchain."""
     env = dict(os.environ)
     env["PATH"] = f"{VENV_BIN}:{CUDA_BIN}:" + env.get("PATH", "")
-    env["CUDA_HOME"] = "/usr/local/cuda-12.9"
-    env["TORCH_CUDA_ARCH_LIST"] = "9.0"
+    env["CUDA_HOME"] = CUDA_HOME
+    env["TORCH_CUDA_ARCH_LIST"] = TORCH_CUDA_ARCH_LIST
     env["CUDA_VISIBLE_DEVICES"] = cfg["gpus"]
     env["REWARD_CUDA_VISIBLE_DEVICES"] = cfg["reward_gpu"]
     env["RUBRIC_VLLM_URL"] = cfg["rubric_url"]

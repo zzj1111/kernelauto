@@ -159,9 +159,31 @@ export RUBRIC_MODEL_NAME=rubric-judge
 export RUBRIC_VLLM_TIMEOUT_SEC=180
 ```
 
-`cudascaffold/run_arm.py` also hardcodes `ROOT = "/mnt/data1/zha00175/StitchCUDA"` (line ~30) —
-update that to the target's repo path, or the run will read/write dataset and checkpoint paths
-on the wrong (source) filesystem.
+### 4.1 Nothing above needs editing a .py file anymore
+
+`cudascaffold/run_arm.py`, `adapters.py`, and `teacher.py` used to hardcode `ROOT`, the CUDA
+toolchain paths, the interpreter, and the Teacher's key-file path. All of that is now either
+auto-detected (`ROOT` is derived from the module's own location — a clone anywhere just works)
+or an env var with the old hardcoded value kept only as the *default* (so the source machine's
+own launch scripts still behave identically). Use `scripts/launch_autoscaffold.sh` instead of
+calling `python -m cudascaffold.run_arm` directly — it's a thin wrapper that turns every one of
+these into a `--flag`:
+
+```bash
+scripts/launch_autoscaffold.sh --help
+scripts/launch_autoscaffold.sh \
+  --exp my_run --gpus 0,1 --model /path/to/model \
+  --venv-python "$(pwd)/.venv/bin/python" --cuda-home /usr/local/cuda-12.9 --arch-list 9.0 \
+  --openai-key-file /path/to/openai.env \
+  --rubric-url http://127.0.0.1:8210/v1/chat/completions \
+  20
+```
+And the rubric judge server itself, same treatment (`scripts/serve_rubric_judge.sh --help`):
+```bash
+scripts/serve_rubric_judge.sh --model /path/to/judge/model --gpu 7 --port 8210
+```
+Full flag reference is in each script's `--help`; every flag has an equivalent env var if you'd
+rather export a block of settings than pass a long command line.
 
 ## 5. About `/dev/shm/verl_env` — **correction**
 
