@@ -163,19 +163,23 @@ export RUBRIC_VLLM_TIMEOUT_SEC=180
 update that to the target's repo path, or the run will read/write dataset and checkpoint paths
 on the wrong (source) filesystem.
 
-## 5. About `/dev/shm/verl_env`
+## 5. About `/dev/shm/verl_env` — **correction**
 
-The source env lives in `/dev/shm`, i.e. tmpfs — RAM-backed, and **wiped on every reboot**
-(this has already bitten this project once; see the `alfworld-autoscaffold-harness` memory note
-for the ALFWorld side of the same lesson). It's fast to import from, which is presumably why it
-was put there, but it means the "environment" on the source machine is not actually durable
-infrastructure — it's rebuilt from scratch after every reboot via whatever install script
-originally produced it (not present as a single script in this repo; this document is the
-reconstruction of that missing script).
+Originally this section said the env lives only in tmpfs and is wiped on every reboot with
+no rebuild script. That was wrong — investigating the ALFWorld/GiGPO side of this same box
+(see `verl-agent/UV_INSTALL.md`) turned up a persistent copy: `/dev/shm/verl_env` and the
+conda env at `/mnt/data1/zha00175/miniconda/envs/verl` have **identical directory mtimes**,
+and `verl-agent/examples/gigpo_trainer/run_alfworld_frombase.sh` confirms the relationship
+directly: `/dev/shm/verl_env` is a tmpfs *speed cache* of that conda env, staged in when
+`/dev/shm/.verl_env_done` exists, falling back to the NFS conda copy otherwise. So the
+environment is not actually fragile in the way this doc first claimed — the conda env is
+the durable source; only whatever changed *only* in the tmpfs copy since it was last staged
+would be lost on reboot.
 
-Recommendation for the new server: put `.venv` on persistent disk (as in §3). Only move it to
-`/dev/shm` deliberately, once you've confirmed local disk import/compile speed is actually a
-bottleneck, and with a rebuild script on hand for the next reboot.
+That doesn't change the install plan above (this doc still builds a plain `uv` venv on
+persistent disk on the target, which is the right call regardless), but it does mean: if you
+ever need to cross-check something odd on the source machine, `/mnt/data1/zha00175/miniconda/envs/verl`
+is the more trustworthy copy to `pip freeze` against, not `/dev/shm/verl_env`.
 
 ## 6. Assets that are not part of the environment
 
