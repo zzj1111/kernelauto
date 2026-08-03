@@ -1,0 +1,53 @@
+# Pinned dependency set for the CudaForge AutoScaffold training path
+# (cudascaffold/ + cudaforge/ + verl FSDP actor + vLLM rollout + LoRA).
+#
+# These are NOT the repo's generic upstream-verl requirements*.txt — they are the exact
+# versions verified working together on 2026-08-03 in the live venv at /dev/shm/verl_env
+# (8x H200, driver 575.57.08, CUDA 12.9 toolkit for nvcc, Python 3.12). That venv is shared
+# across several unrelated projects (ALFWorld/GiGPO, math evals, ...); this file keeps only
+# what cudascaffold/cudaforge actually import, trimmed of the unrelated extras (sglang,
+# mcore/megatron, transformer_engine, TransferQueue — all optional/config-gated, see
+# UV_INSTALL.md "Deliberately excluded" section).
+#
+# Install order matters — see UV_INSTALL.md. Do not `uv pip install -r` this file blindly
+# before torch is in place; flash-attn's wheel is ABI-pinned to torch==2.8.0 cp312.
+
+# --- core verl / training loop ---
+accelerate==1.12.0
+codetiming==1.4.0
+datasets==4.4.1
+dill==0.4.0
+hydra-core==1.3.2
+numpy==2.2.6
+pandas==2.3.3
+peft==0.18.0
+pyarrow==22.0.0
+pybind11==3.0.1
+pylatexenc==2.10
+ray[default]==2.52.1
+torchdata==0.11.0
+tensordict==0.10.0
+transformers==4.56.1
+wandb==0.23.1
+packaging==25.0
+tensorboard==2.20.0
+
+# --- GPU stack (Hopper / sm_90 build; adjust TORCH_CUDA_ARCH_LIST for other GPUs) ---
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+ninja==1.13.0
+
+# --- rollout backend (StitchCUDA launches with actor_rollout_ref.rollout.name=vllm) ---
+vllm==0.11.0
+fastapi==0.124.0
+uvicorn==0.38.0
+
+# --- cudascaffold Teacher (GPT controller calls) ---
+openai==1.99.1
+
+# --- flash-attn: custom local wheel, NOT on PyPI in this exact build ---
+# Built for: cp312, torch 2.8, cu12, cxx11abiFALSE. Either copy the wheel file itself
+# (fastest — see UV_INSTALL.md) or rebuild from source once torch is installed:
+#   uv pip install flash-attn==2.8.1 --no-build-isolation
+# flash_attn==2.8.1

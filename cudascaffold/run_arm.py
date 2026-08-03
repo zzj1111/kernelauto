@@ -1,0 +1,200 @@
+"""Entry point: assemble the CUDA auto-scaffold arm and run the loop.
+
+The Teacher's prompt and observation are NOT redefined here — they come from
+`cudascaffold/observation.py`, which is the ALFWorld module unchanged. Everything domain-specific
+reaches it through `CUDA_DOMAIN` (scaffold.py): the category labels, what one instance is and how
+it is scored, whether reference solutions exist, whether text can be attached per instance. That
+is the whole point of the Domain-descriptor pattern — swapping ALFWorld for CUDA kernels is a
+data change, not a prompt rewrite.
+
+What the Teacher sees each cycle (assembled by observation.assemble_observation):
+  signals.per_task_gap[cat]    bare vs injected mean reward on the SAME train rows, this policy
+  signals.all_fail_groups[cat] categories where the reward is 0 (wrong or uncompilable = no
+                               gradient); this domain's equivalent of an all-fail rollout group
+  signals.valid_seen           held-out mean reward on test.parquet, never scaffolded
+  signals.eval_trajectory      that number across all cycles, with each point's draws
+  decision_history             its own past proposals, the A/B verdict on each, and what
+                               held-out success did afterwards
+
+What it may change:
+  text_ops  free-form text per scope: general | scratch | improve_l1 | improve_l2 | improve_l3
+  p_ops     per-category injection probability, capped at P_MAX and rate-limited per cycle
+Both go through the same gates as the ALFWorld arm: text must beat the live scaffold in a paired
+A/B before it takes effect, and p edits submitted alongside rejected text are discarded with it.
+"""
+from __future__ import annotations
+
+import os
+
+# This repo trains with stock verl GRPO: the loss is conditioned on the prompt that was
+# actually used, and there is no bare-prompt re-conditioning anywhere in it. The shared
+# observation module derives its description of the loss from ARM_BARE_LOSS, so it must be
+# False here or the Teacher is told a mechanism that does not exist — and every judgement it
+# makes about what text can buy follows from that mechanism. Set before importing observation.
+os.environ.setdefault("ARM_BARE_LOSS", "False")
+
+from . import adapters as A
+from . import scaffold as S
+from . import teacher as T
+from . import loop as L
+
+ROOT = "/mnt/data1/zha00175/StitchCUDA"
+
+
+def default_cfg():
+    exp = os.environ.get("ARM_EXP", "cuda_scaffold_8b")
+    root = f"/mnt/data1/zha00175/exp_cudaforge/{exp}"
+    work = f"{root}/work"
+    os.makedirs(work, exist_ok=True)
+    return {
+        "exp": exp,
+        "project": "CudaForge_AutoScaffold",
+        # --- placement (user-assigned): train 0,1 | kernel benchmark 3 | rubric judge 7 ---
+        "gpus": os.environ.get("ARM_GPUS", "0,1"),
+        "n_gpus": int(os.environ.get("ARM_N_GPUS", "2")),
+        "tp_size": int(os.environ.get("ARM_TP", "2")),
+        "reward_gpu": os.environ.get("ARM_REWARD_GPU", "3"),
+        "rubric_url": os.environ.get("RUBRIC_VLLM_URL", "http://127.0.0.1:8210/v1/chat/completions"),
+        "rubric_model": os.environ.get("RUBRIC_MODEL_NAME", "rubric-judge"),
+        "rubric_timeout": int(os.environ.get("RUBRIC_VLLM_TIMEOUT_SEC", "120")),
+        # --- model / data ---
+        "model": os.environ.get("ARM_MODEL",
+                                "/mnt/data1/zha00175/models/drkernel-8b-coldstart"),
+        # train_new.parquet is the only dump carrying `level` and `task_name`, which the category
+        # scopes and the group-level injection coin flip both need.
+        "train_file": os.environ.get("ARM_TRAIN_FILE",
+                                     f"{ROOT}/dataset/CudaForge/train_new.parquet"),
+        "val_file": os.environ.get("ARM_VAL_FILE", f"{ROOT}/dataset/CudaForge/test.parquet"),
+        "reward_path": os.environ.get("ARM_REWARD", f"{ROOT}/cudaforge/reward_bench_rubric.py"),
+        # --- optimisation (from experiments/Qwen3-32B_KL003_1e-6_Rubric.sh, scaled to 2 GPUs) ---
+        "lora_rank": int(os.environ.get("ARM_LORA_RANK", "128")),
+        "lora_alpha": int(os.environ.get("ARM_LORA_ALPHA", "128")),
+        "lr": os.environ.get("ARM_LR", "1e-6"),
+        "kl_loss_coef": os.environ.get("ARM_KL", "0.03"),
+        "train_batch_size": int(os.environ.get("ARM_TRAIN_BS", "8")),
+        "ppo_mini_batch_size": int(os.environ.get("ARM_MINI_BS", "4")),
+        "micro_bs": int(os.environ.get("ARM_MICRO_BS", "1")),
+        "rollout_n": int(os.environ.get("ARM_ROLLOUT_N", "6")),
+        "gpu_mem": float(os.environ.get("ARM_GPU_MEM", "0.35")),
+        "max_prompt_length": int(os.environ.get("ARM_MAX_PROMPT", "8192")),
+        "max_response_length": int(os.environ.get("ARM_MAX_RESP", "16384")),
+        "total_epochs": int(os.environ.get("ARM_EPOCHS", "20")),
+        # --- loop knobs ---
+        "steps_per_cycle": int(os.environ.get("ARM_K", "10")),
+        "val_n": int(os.environ.get("ARM_VAL_N", "3")),
+        "n_per_task": int(os.environ.get("ARM_NPT", "8")),
+        "domain": S.CUDA_DOMAIN,
+        "teacher_priors": os.environ.get("ARM_PRIORS", "0") == "1",
+        # How many cycles the scaffold may stay empty before the pre-check is bypassed. The
+        # previous run declined 20/20 and ended having measured nothing about whether text helps.
+        # Set to 0 to disable the floor and restore pure Teacher discretion.
+        "intervene_floor_cycles": int(os.environ.get("ARM_FLOOR_CYCLES", "3")),
+        "n_cycles": int(os.environ.get("ARM_N_CYCLES", "20")),
+        "base_seed": 20260801,
+        # --- paths ---
+        "ckpt_root": os.environ.get("ARM_CKPT",
+                                    f"/mnt/data1/zha00175/cuda_scaffold_ckpts/{exp}"),
+        "work": work,
+        "log_dir": f"{root}/logs",
+        "scaffold_path": f"{root}/scaffold.json",
+        "journal_path": f"{root}/journal.json",
+        "state_path": f"{root}/state.json",
+        "train_log": f"{root}/train.log",
+        "ray_tmp": os.environ.get("ARM_RAY_TMP", f"/dev/shm/zray_{exp}"),
+    }
+
+
+STATE_KEYS = ("cycle", "step", "scaffold", "sr_history", "best", "best_step",
+              "decision_history", "last_eval")
+
+
+def _load(path, default):
+    import json
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def build_fns(cfg):
+    os.makedirs(cfg["log_dir"], exist_ok=True)
+
+    def log(msg):
+        with open(f"{os.path.dirname(cfg['scaffold_path'])}/orch.log", "a") as f:
+            f.write(msg + "\n")
+        print(msg, flush=True)
+
+    cfg["log"] = log
+
+    def train_fn(scaf, frm, to):
+        A.persist_scaffold(scaf, cfg["scaffold_path"])
+        return A.train_adapter(scaf, frm, to, cfg)
+
+    def eval_fn(ckpt, val_n):
+        return A.eval_adapter(ckpt, val_n, cfg)
+
+    def signals_fn(ckpt, scaf):
+        return A.signals_adapter(ckpt, scaf, cfg, seed=cfg["base_seed"] + _step_of(ckpt))
+
+    def measure_ab_fn(ckpt, cur, cand, tasks):
+        return A.measure_ab_adapter(ckpt, cur, cand, tasks, cfg,
+                                    seed=cfg["base_seed"] + _step_of(ckpt))
+
+    def teacher_fn(obs):
+        return T.propose(obs, call_fn=T.openai_call, domain=cfg["domain"],
+                         priors=cfg["teacher_priors"])
+
+    def triage_fn(obs):
+        return T.triage(obs, call_fn=T.openai_call)
+
+    return {"train_fn": train_fn, "eval_fn": eval_fn, "signals_fn": signals_fn,
+            "measure_ab_fn": measure_ab_fn, "teacher_fn": teacher_fn, "triage_fn": triage_fn,
+            "persist_fn": lambda s: A.persist_scaffold(s, cfg["scaffold_path"]),
+            "journal_fn": lambda h: A.persist_scaffold(h, cfg["journal_path"]),
+            "state_fn": lambda st: A.persist_scaffold(
+                {k: st[k] for k in STATE_KEYS if k in st}, cfg["state_path"]),
+            "log": log}
+
+
+def _step_of(ckpt):
+    try:
+        return int(str(ckpt).rstrip("/").split("global_step_")[-1])
+    except Exception:
+        return 0
+
+
+def main(n_cycles=20):
+    cfg = default_cfg()
+    fns = build_fns(cfg)
+    saved = _load(cfg["state_path"], None)
+    if saved and "step" in saved:
+        state = {**L.new_state(), **saved}
+        fns["log"](f"[autoscaffold] RESUME {cfg['exp']} at cycle {state.get('cycle')} "
+                   f"step={state['step']} scaffold v{state['scaffold'].get('version')} "
+                   f"best={state.get('best')}@{state.get('best_step')}")
+    else:
+        step0 = A.existing_ckpt_step(cfg)
+        state = L.new_state(step0=step0, scaffold=S.empty_scaffold(cfg["domain"]))
+        state["best_step"] = step0
+        prior = _load(cfg["journal_path"], [])
+        if isinstance(prior, list) and prior:
+            state["decision_history"] = prior
+            fns["log"](f"[autoscaffold] loaded {len(prior)} prior decisions as Teacher memory")
+        A.persist_scaffold(state["scaffold"], cfg["scaffold_path"])
+        fns["log"](f"[autoscaffold] arm={cfg['exp']} model={os.path.basename(cfg['model'])} "
+                   f"train_gpus={cfg['gpus']} reward_gpu={cfg['reward_gpu']} "
+                   f"scopes={cfg['domain'].scopes()} K={cfg['steps_per_cycle']} "
+                   f"VAL_N={cfg['val_n']} empty scaffold")
+
+    target = int(os.environ.get("ARM_TARGET_STEP", "0") or 0)
+    if target:
+        cfg["stop_fn"] = lambda st: st.get("step", 0) >= target
+        fns["log"](f"[autoscaffold] absolute target step {target} "
+                   f"(n_cycles={n_cycles} caps this process only)")
+    return L.run(state, fns, cfg, n_cycles)
+
+
+if __name__ == "__main__":
+    import sys
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 20)

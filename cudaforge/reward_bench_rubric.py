@@ -222,9 +222,24 @@ IMPORTANT:
 # Common Helpers
 # ============================================================
 
+# Qwen3 and other reasoning models emit their scratchpad first: <think> ... </think> answer.
+# Draft kernels inside that scratchpad are code blocks like any other, and taking the FIRST block
+# in the raw string would grade a draft the model then went on to reject. Strip the reasoning span
+# before extracting so the block that gets compiled is the one the model actually put forward.
+#
+# Unterminated <think> (generation truncated mid-reasoning) leaves nothing to grade — dropping the
+# whole tail is correct there too: an answer was never emitted.
+_THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
+
+
 def _extract_python_code(solution_str: str) -> str:
-    m = _CODEBLOCK_RE.search(solution_str)
-    return (m.group(1) if m else solution_str).strip()
+    body = _THINK_RE.sub("", solution_str or "")
+    m = _CODEBLOCK_RE.search(body)
+    if m:
+        return m.group(1).strip()
+    # No fenced block outside the reasoning span. Fall back to the stripped body rather than the
+    # raw string so a draft inside <think> still cannot be mistaken for the answer.
+    return body.strip()
 
 def _safe_tail(s: str, n: int) -> str:
     if not s:
@@ -981,7 +996,13 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     reference_code = extra_info["answer"]
 
     correctness, speedup = bench(solution_str, reference_code)
-    print(f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}")
+    # task_name/level are echoed so an outer harness can attribute a reward to the INSTANCE that
+    # produced it. verl's own validation only reports per-data_source means, which cannot say
+    # which kernel task is failing — and "which instance is stuck" is the whole basis for
+    # per-instance scaffolding. Print only; nothing about the score changes.
+    _ei = extra_info or {}
+    print(f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
+          f"task_name:{_ei.get('task_name')}, level:{_ei.get('level')}")
 
     if correctness != 1:
         return 0.0
