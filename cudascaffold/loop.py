@@ -57,9 +57,21 @@ def _summary(action):
     """Record of what the Teacher proposed. Keeps the ACTUAL TEXT, not just the target names:
     the wording is the thing the A/B gate judged, so it is what the Teacher must see next cycle
     to learn which phrasings won or lost (otherwise it re-proposes the same failed text)."""
-    txt = [op["target"] for op in action.get("text_ops", [])]
+    items = list(action.get("item_ops") or [])
+    txt = [f"{op.get('op')}:{op.get('scope') or op.get('id')}" for op in items]
+    # A LIST, not a dict. This is the Teacher's memory of its own proposals — compact_history
+    # feeds it back so it can see which exact wording lost an A/B and not re-propose it. Keyed by
+    # "op:scope" it collided: three rubrics added to `loss` in one cycle share that key, so two of
+    # the three vanished from the record and the Teacher would re-propose them as if new.
+    proposed = [{k: v for k, v in
+                 (("op", op.get("op")), ("scope", op.get("scope")), ("id", op.get("id")),
+                  ("kind", op.get("kind")), ("text", op.get("text")),
+                  ("alpha", op.get("alpha"))) if v is not None}
+                for op in items]
+    txt += [op["target"] for op in action.get("text_ops", [])]
+    proposed += [{"op": "set", "scope": op["target"], "text": op["text"]}
+                 for op in action.get("text_ops", [])]
     pch = {op["task"]: op["p"] for op in action.get("p_ops", [])}
-    proposed = {op["target"]: op["text"] for op in action.get("text_ops", [])}
     alpha = {op["uid"]: op["alpha"] for op in action.get("prefix_ops", [])}
     return {"text_edits": txt, "p_edits": pch, "text_proposed": proposed,
             "alpha_edits": alpha, "diagnosis": action.get("diagnosis", "")}
@@ -183,7 +195,8 @@ def decide(state, fns, cfg, ckpt, sr, ev, cyc):
             per_task=(ev or {}).get("per_task"), per_task_n=(ev or {}).get("per_task_n"),
             train_rollouts=state.get("train_rollouts"),
             cycle=cyc, n_cycles=cfg.get("n_cycles"),
-            floor_cycles=cfg.get("intervene_floor_cycles")))
+            floor_cycles=cfg.get("intervene_floor_cycles"),
+            zero_gradient=cfg.get("_last_zero_gradient")))
         log(f"[c{cyc}] triage: {'measure' if go else 'SKIP'} — {why}")
         if not go:
             state["decision_history"].append({
@@ -203,7 +216,10 @@ def decide(state, fns, cfg, ckpt, sr, ev, cyc):
     # 6) Teacher proposes (or declines)
     obs = assemble_observation(state["scaffold"], signals, state["decision_history"],
                                state["step"], cfg.get("domain"))
-    action, note = fns.get("teacher_fn", default_teacher)(obs)
+    try:
+        action, note = fns.get("teacher_fn", default_teacher)(obs, state["scaffold"])
+    except TypeError:                      # a test double that predates the scaffold argument
+        action, note = fns.get("teacher_fn", default_teacher)(obs)
     log(f"[c{cyc}] teacher: {note}; edits={_summary(action)['text_edits']} p={_summary(action)['p_edits']}")
 
     if S.is_noop(action):
@@ -223,20 +239,47 @@ def decide(state, fns, cfg, ckpt, sr, ev, cyc):
                                           "sr_after": None, "verdict": "noop"})
         return _journal(state, fns)
 
+    # A teacher_fn that answers in the older whole-scope form reaches here WITHOUT having gone
+    # through teacher.normalize (a harness that calls the model itself, a replayed journal entry).
+    # is_noop() counts text_ops as an intervention, so such an action clears the decline check and
+    # is then dropped by the item-ops branch below: no A/B, no edit, and a "rejected" verdict
+    # recorded against a proposal nothing ever measured. Translate it instead — the mapping is
+    # exact ("this scope's text is now X" = delete what is there, add one entry).
+    if action.get("text_ops") and not action.get("item_ops"):
+        from . import teacher as _teacher
+        action = {**action,
+                  "item_ops": _teacher._as_item_ops(action, S.migrate_items(state["scaffold"],
+                                                                            cfg.get("domain")),
+                                                    cfg.get("domain"))}
+
     # 7) text changes go through the frozen-policy A/B door; p changes apply directly
     scaf = state["scaffold"]
     ab_result = None
     accepted_text = False
     p_applied = False
-    if action.get("text_ops"):
-        candidate = S.apply_text_ops(scaf, action["text_ops"])
-        tasks = S.touched_tasks(action["text_ops"], cfg.get("domain"))
-        measure = fns["measure_ab_fn"](ckpt, scaf, candidate, tasks)
-        ab_result = gates.ab_gate(measure, tasks)
-        if ab_result["accept"]:
-            scaf = candidate
-            accepted_text = True
-        log(f"[c{cyc}] A/B: {ab_result['reason']}")
+    if action.get("item_ops"):
+        # The A/B still compares the WHOLE set, not one item: with the measured noise floor
+        # (same-condition arms differed by 7.4 points at n=300 on 2026-08-03), a per-item contrast
+        # would need a randomized-subset design and the user chose to keep the whole-set
+        # comparison. What items buy here is a bounded, itemised diff — the budget caps how much
+        # of the set can move behind a single verdict, so one ACCEPT covers at most a few entries
+        # rather than a wholesale rewrite.
+        candidate, budget_notes = S.apply_item_ops(scaf, action["item_ops"],
+                                                   cfg.get("domain"), step=state["step"])
+        for n in budget_notes:
+            log(f"[c{cyc}] budget: {n}")
+        tasks = S.touched_scopes(action["item_ops"], scaf, cfg.get("domain"))
+        if candidate.get("items") == S.migrate_items(scaf, cfg.get("domain")).get("items"):
+            # Both sides are migrated so the comparison is between two normalised shapes; comparing
+            # a migrated candidate against a raw scaffold would read "changed" on every cycle.
+            log(f"[c{cyc}] every edit was dropped by the budget — nothing to A/B")
+        else:
+            measure = fns["measure_ab_fn"](ckpt, scaf, candidate, sorted(tasks))
+            ab_result = gates.ab_gate(measure, sorted(tasks))
+            if ab_result["accept"]:
+                scaf = candidate
+                accepted_text = True
+            log(f"[c{cyc}] A/B: {ab_result['reason']}")
 
     # A rejected text verdict also throws away the p edits that rode with it. The Teacher
     # proposes text and p as ONE action justified by one diagnosis; p is the unmeasured half

@@ -14,22 +14,50 @@ from . import observation as O
 from . import scaffold as S
 
 MODEL = os.environ.get("AUTOSCAFFOLD_TEACHER_MODEL", "gpt-5.5")
-DEFAULT_KEY_FILE = os.environ.get("AUTOSCAFFOLD_OPENAI_KEY_FILE",
-                                   "/mnt/data1/zha00175/tool-agent-secrets/openai.env")
-NOOP = {"diagnosis": "", "text_ops": [], "p_ops": []}
+# No default path. OPENAI_API_KEY in the environment is the normal route; a default
+# naming one machine's secret store is a promise a clone cannot keep, and an empty key
+# makes the Teacher decline every cycle for a reason nothing reports.
+DEFAULT_KEY_FILE = os.environ.get("AUTOSCAFFOLD_OPENAI_KEY_FILE") or None
+NOOP = {"diagnosis": "", "item_ops": [], "p_ops": []}
 
 
-def normalize(raw, domain=None):
+def _as_item_ops(raw, scaffold, domain):
+    """The Teacher's edits as item ops, translating the older whole-scope `text_ops` if it emits
+    those instead. A text_op meant 'this scope's text is now X', which in item terms is 'remove
+    what is there and add one entry' — so the translation is exact rather than a guess, and a
+    model that answers in the old format loses a cycle to a no-op for no reason."""
+    if raw.get("item_ops"):
+        return list(raw["item_ops"])
+    out = []
+    for op in (raw.get("text_ops") or []):
+        if not isinstance(op, dict):
+            return [op]                       # let validation reject it, with its own message
+        scope = op.get("target")
+        for it in S.items_of(scaffold, scope):
+            out.append({"op": "delete", "id": it["id"]})
+        out.append({"op": "add", "scope": scope, "text": op.get("text")})
+    return out
+
+
+def normalize(raw, domain=None, scaffold=None):
     """Coerce a raw Teacher dict into a validated action, or a no-op on any problem.
-    Returns (action, note). Physical validation only."""
+    Returns (action, note). Physical validation only — never a judgment about the content.
+
+    `scaffold` is needed because item ops are validated AGAINST it: an update or delete names an
+    id, and whether that id exists is not a property of the op alone.
+    """
     if not isinstance(raw, dict):
         return dict(NOOP), "non-dict output -> no-op"
+    scaf = scaffold if scaffold is not None else S.empty_scaffold(domain)
     action = {
         "diagnosis": str(raw.get("diagnosis", "") or "")[:2000],
-        "text_ops": raw.get("text_ops") or [],
+        "item_ops": _as_item_ops(raw, scaf, domain),
         "p_ops": raw.get("p_ops") or [],
     }
-    ok, reason = S.validate_action(action, domain)
+    ok, reason = S.validate_item_ops(action["item_ops"], scaf, domain)
+    if not ok:
+        return dict(NOOP), f"invalid action ({reason}) -> no-op"
+    ok, reason = S.validate_action({"text_ops": [], "p_ops": action["p_ops"]}, domain)
     if not ok:
         return dict(NOOP), f"invalid action ({reason}) -> no-op"
     return action, "ok"
@@ -56,16 +84,20 @@ def openai_call(system, user, key_file=DEFAULT_KEY_FILE, model=MODEL, max_tokens
     return json.loads(r.choices[0].message.content)
 
 
-def propose(obs, call_fn=openai_call, domain=None, priors=False):
+def propose(obs, call_fn=openai_call, domain=None, priors=False, scaffold=None):
     """Render prompt -> call_fn(system, user) -> normalized, validated action.
-    Any exception in the call becomes a no-op (the run continues on the current scaffold)."""
+    Any exception in the call becomes a no-op (the run continues on the current scaffold).
+
+    `scaffold` is the live scaffold the ops will be applied to; validation needs it to resolve
+    the item ids an update/delete names.
+    """
     system = O.render_system_prompt(domain, priors=priors)
     user = O.render_user_prompt(obs)
     try:
         raw = call_fn(system, user)
     except Exception as e:  # network / parse / auth — degrade to no-op, never crash
         return dict(NOOP), f"teacher call failed ({str(e)[:150]}) -> no-op"
-    return normalize(raw, domain)
+    return normalize(raw, domain, scaffold=scaffold)
 
 
 # Errors that mean the Teacher ITSELF cannot be reached, as opposed to a Teacher that answered

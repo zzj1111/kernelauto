@@ -19,6 +19,12 @@ Everything else (what to change, based on what) is the Teacher's job.
 """
 from __future__ import annotations
 
+import os
+
+# How many standard errors of the difference a candidate must clear. Calibrated against six real
+# same-condition A/B pairs, not chosen by preference — see ab_gate's docstring.
+NOISE_K = float(os.environ.get("ARM_AB_NOISE_K", "2.2"))
+
 
 def _weighted_mean(per_task, tasks):
     """n-weighted mean success over `tasks`; returns (mean, total_n)."""
@@ -40,10 +46,50 @@ def ab_gate(measure, tasks):
     tasks:   the touched tasks (from scaffold.touched_tasks); the comparison is aggregated
              over exactly these (a 'general' edit touches all tasks).
 
-    ACCEPT iff candidate simply beats current on the touched tasks (strict >, no margin —
-    per the locked decision). No retries: a rejected proposal is discarded and the current
-    scaffold trains on unchanged; the Teacher re-proposes next cycle.
-    Returns {accept, reason, cand_mean, cur_mean, bare_mean, n}.
+    ACCEPT iff the candidate beats the current text by more than the sampling noise of the
+    comparison itself.
+
+    The margin is not a tunable preference — it exists because a strict `>` was measured to be a
+    coin flip. Generation is not reproducible run to run (see measure_ab_adapter): at n=24 per
+    category, two passes over BYTE-IDENTICAL prompts differed by up to 6 of 24 tasks, so a bare
+    `>` accepted or rejected on differences the measurement cannot resolve. Since both arms are
+    Bernoulli over the same rows, the standard error of the DIFFERENCE is
+
+        sqrt( p_c(1-p_c)/n_c + p_k(1-p_k)/n_k )
+
+    NOISE_K multiplies it. Replaying the six real same-condition category pairs of step 40 as if
+    they were candidate-vs-current gives the ratio of an observed same-condition difference to its
+    own binomial SE:
+
+        matmul 0.00 · norm_softmax 0.00 · elementwise 0.87 · reduce 1.42 · loss 1.91 · conv 2.04
+
+    K=1 passes three of the six as improvements; K=1.5 still passes two; K=2.2 passes none.
+
+    Those numbers are ordinary sampling noise, not a special property of this stack. A chi-square
+    test of homogeneity over the six pairs gives 10.58 on 6 df against a 12.59 critical value:
+    the spread is within what plain binomial sampling at n=24 predicts. The two passes agree to
+    4.2 points in aggregate (30/144 vs 24/144) and the per-category swings cancel in direction —
+    the alarming '1/24 vs 6/24, six times worse!' is a ratio read at a low base rate, and is 5
+    tasks, or 2.2 sigma. Generation nondeterminism is real (112 of 112 recoverable responses
+    differed) but mostly does not change a verdict: a different program usually meets the same
+    fate. So K is not correcting for an exotic noise source. It is just 2 sigma, and the actual
+    disease was always n=24.
+
+    K sets the false-positive rate ALONE — raising n shrinks the noise and the margin by the same
+    sqrt(n), leaving the ratio above unchanged. What n buys is resolution: the smallest real effect
+    that can clear the bar. So the two are tuned separately — K here against the observed noise
+    distribution, n in measure_ab_adapter by spending the row budget only on categories the
+    proposal actually touched. Together they put the bar near 6 points, against the ~23 that a
+    strict `>` at n=24 could honestly resolve.
+
+    K is deliberately conservative because the errors are not symmetric. A rejected proposal costs
+    one cycle — the Teacher re-proposes next cycle with the same evidence. An accepted one is
+    permanent: the revert_gate was removed 2026-07-29, so nothing rewinds a scaffold that turns out
+    to be noise, and it keeps being injected into half the training prompts for the rest of the run.
+
+    No retries: a rejected proposal is discarded and the current scaffold trains on unchanged; the
+    Teacher re-proposes next cycle.
+    Returns {accept, reason, cand_mean, cur_mean, bare_mean, margin, n}.
     """
     if not tasks:
         return {"accept": False, "reason": "no touched tasks (nothing to A/B)", "n": 0}
@@ -53,11 +99,15 @@ def ab_gate(measure, tasks):
     if not cur_n or not cand_n:
         return {"accept": False, "reason": "missing A/B samples -> reject (keep current)",
                 "cand_mean": cand_mean, "cur_mean": cur_mean, "bare_mean": bare_mean, "n": 0}
-    accept = cand_mean > cur_mean
-    reason = (f"candidate {cand_mean:.3f} {'>' if accept else '<='} current {cur_mean:.3f} "
-              f"(bare {bare_mean:.3f}) -> {'ACCEPT' if accept else 'reject'}")
+    margin = NOISE_K * ((cur_mean * (1 - cur_mean) / cur_n)
+                        + (cand_mean * (1 - cand_mean) / cand_n)) ** 0.5
+    accept = cand_mean > cur_mean + margin
+    reason = (f"candidate {cand_mean:.3f} vs current {cur_mean:.3f} "
+              f"(bare {bare_mean:.3f}, margin {margin:.3f}, n {cur_n}+{cand_n}) "
+              f"-> {'ACCEPT' if accept else 'reject'}")
     return {"accept": accept, "reason": reason, "cand_mean": round(cand_mean, 3),
-            "cur_mean": round(cur_mean, 3), "bare_mean": round(bare_mean, 3), "n": cur_n + cand_n}
+            "cur_mean": round(cur_mean, 3), "bare_mean": round(bare_mean, 3),
+            "margin": round(margin, 4), "n": cur_n + cand_n}
 
 
 def update_best(best, best_step, sr, step):

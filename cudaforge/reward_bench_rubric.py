@@ -1,6 +1,27 @@
 import subprocess
 import json
 import re, os, sys, time
+import threading
+
+# ---------------------------------------------------------------------------------------------
+# HARD CAP on how many kernel_runner.py subprocesses may exist at once.
+#
+# verl's RewardLoopWorker creates one asyncio task PER ROW with no limit
+# (verl/experimental/reward/reward_manager.py:81), so a 900-row batch asks for 900 concurrent
+# scores, and each score forks a fresh Python that initialises a CUDA context on the reward GPU,
+# compiles, benchmarks, and exits.
+#
+# On 2026-08-04 that produced 243 kernel_runner processes inside 82 seconds on one GPU. They
+# wedged the driver: 105 stuck in uvm_gpu_release, 37 in uvm_gpu_retain_by_uuid, 94 queued on the
+# rwsem between them — one batch creating contexts while another destroyed them, deadlocked
+# inside the kernel module. D-state processes do not take SIGKILL (verified: SIGKILL sat pending
+# for hours), no new process could so much as import torch, and the node needed a reboot.
+#
+# The cap is on CONTEXT CREATION, which is the scarce thing here — not on CPU or on throughput.
+# Compilation and benchmarking still overlap; what cannot overlap is 900 processes racing to
+# attach to the same GPU.
+_MAX_CONCURRENT = int(os.environ.get("CUDAFORGE_MAX_CONCURRENT_RUNNERS", "12"))
+_RUNNER_SLOTS = threading.Semaphore(_MAX_CONCURRENT)
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -988,6 +1009,7 @@ def bench(
     out = ""
     err = ""
     try:
+      with _RUNNER_SLOTS:                      # bounded GPU-context creation; see _MAX_CONCURRENT
         p = subprocess.run(
             cmd,
             input=(json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"),

@@ -82,8 +82,13 @@ def test_both_prompts_agree_declining_has_a_run_level_cost():
 
 
 def test_both_prompts_state_the_ab_gate_bounds_the_downside():
-    for p in (O.render_system_prompt(S.CUDA_DOMAIN), TRI):
-        assert "discarded unless it wins" in p
+    """The CLAIM, not one phrasing of it: a Teacher that does not know its proposals are filtered
+    will weigh a wrong proposal as if it damaged the run. Asserted per prompt because they say it
+    differently — propose states the acceptance rule, triage states the consequence — and pinning
+    a literal string made an ordinary deduplication look like a regression."""
+    prop = O.render_system_prompt(S.CUDA_DOMAIN)
+    assert "A/B" in prop and "accepted only if" in prop and "beats the current text" in prop
+    assert "A/B" in TRI and "discarded unless it wins" in TRI
 
 
 def test_no_stale_measured_claim_from_another_domain():
@@ -210,10 +215,21 @@ def test_p_limits_in_prompt_match_the_constants():
     _each_arm(check)
 
 
-def test_text_cap_is_not_disclosed_as_a_number():
+def test_length_is_steered_by_words_and_capped_by_a_number_never_disclosed():
+    """Two separate mechanisms that must not be confused.
+
+    The CAP voids the entire action rather than truncating it (scaffold.validate_action), and the
+    Teacher is never told the number — so a cap tight enough to shape the text would turn
+    proposals into no-ops it could not diagnose. It is a crash guard only, and must stay silent.
+
+    LENGTH POLICY is therefore carried by the prompt, in words. The prompt used to say the
+    opposite ('no length target ... prefer being explicit over being short'), which is what
+    produced 1450-1550-character blocks on top of a ~4600-character training prompt.
+    """
     def check(domain, prompt, tr, te):
-        assert str(S.MAX_TEXT_CHARS) not in prompt
-        assert "no length target" in prompt
+        assert str(S.MAX_TEXT_CHARS) not in prompt, "the cap must stay undisclosed"
+        assert "Be CONCISE" in prompt, "brevity must be asked for explicitly"
+        assert "no length target" not in prompt, "the old anti-brevity wording must be gone"
     _each_arm(check)
 
 
@@ -265,3 +281,41 @@ if __name__ == "__main__":
             print(f"  FAIL {name}: {e}")
     print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILED'}")
     sys.exit(1 if fails else 0)
+
+
+def test_the_prompt_describes_the_trace_shape_the_domain_can_actually_produce():
+    """A multi-turn domain pairs a success and a failure of the same episode step by step; a
+    single-turn one has one answer per attempt and nothing to walk through. Describing the
+    wrong shape offers the Teacher a field that is always empty — the defect this prompt has
+    already had to correct for hints and for rubrics."""
+    multi = O.render_system_prompt(S.ALF_DOMAIN)
+    single = O.render_system_prompt(S.TRITON_DOMAIN)
+    assert S.ALF_DOMAIN.multi_turn and not S.TRITON_DOMAIN.multi_turn
+
+    for field in ("contrastive_traces", "failure_patterns"):
+        assert field in multi, f"{field} missing from the multi-turn prompt"
+        assert field not in single, f"{field} offered to a single-turn domain"
+    assert "failure_trajectories" in single
+    assert "failure_trajectories" not in multi
+
+    # And the packet carries whichever the prompt described, not the other.
+    for dom, present, absent in ((S.ALF_DOMAIN, "contrastive_traces", "failure_trajectories"),
+                                 (S.TRITON_DOMAIN, "failure_trajectories", "contrastive_traces")):
+        obs = O.assemble_observation(S.empty_scaffold(dom), {}, [], 10, dom)
+        assert present in obs and absent not in obs, (dom.name, sorted(obs))
+
+
+def test_no_field_reaches_the_teacher_that_the_prompt_does_not_describe():
+    """Both directions of the same rule. A described field with no source reads as "this was
+    empty this cycle"; a field with no description is a number the Teacher has to guess the
+    meaning of. This module has had to correct both — hints and rubrics offered to a domain
+    that refuses them, and failure_patterns shipped to a single-turn domain that has no steps
+    to compute it from."""
+    structural = {"step", "objective", "scopes", "current_scaffold", "decision_history"}
+    for name in ("ALF_DOMAIN", "TRITON_DOMAIN", "CUDA_DOMAIN"):
+        dom = getattr(S, name)
+        prompt = O.render_system_prompt(dom)
+        obs = O.assemble_observation(S.empty_scaffold(dom), {}, [], 10, dom)
+        fields = (set(obs) | set(obs.get("signals") or {})) - structural
+        missing = sorted(f for f in fields if f not in prompt)
+        assert not missing, f"{name}: in the packet, absent from the prompt: {missing}"

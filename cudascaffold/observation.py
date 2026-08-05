@@ -100,7 +100,7 @@ def assemble_observation(current_scaffold, signals, decision_history, step, doma
 
     signals is a dict the loop fills from train-side measurement, e.g.:
       per_task_gap:    {task: {"bare": float, "injected": float, "n": int}}   (frozen policy, train)
-      all_fail_groups: {task: {"all_fail": int, "total": int}}               (train rollout groups)
+      zero_gradient_groups: {task: {"all_fail": int, "total": int}}               (train rollout groups)
       failures:        [ {task, transcript, opens, takes, held, ...} ]        (train, mode=none)
       successes:       [ ... few contrasting successes ... ]
       valid_seen:      {"avg": float, "per_task": {...}, "draws": [...]}      (validation anchor, read-only)
@@ -114,36 +114,70 @@ def assemble_observation(current_scaffold, signals, decision_history, step, doma
                      "evaluated with NO scaffold. So the scaffold is a training aid, not "
                      "something the model keeps at test time.",
         "scopes": domain.scopes(),
+        # `items` is the addressable form and `general_skill`/`skills` its rendering. Both are
+        # shown: the ids are what an update or delete names, and the rendered strings are what the
+        # policy actually reads, so a Teacher given only one of them could either not address an
+        # entry or not see what that entry does to the prompt.
         "current_scaffold": {
+            "items": {sc: [{k: it.get(k) for k in ("id", "kind", "text", "step")}
+                           for it in S.items_of(current_scaffold, sc)]
+                      for sc in S.scopes_of(current_scaffold, domain)},
             "general_skill": current_scaffold.get("general_skill", ""),
             "skills": current_scaffold.get("skills", {}),
             "p_task": current_scaffold.get("p_task", {}),
             "version": current_scaffold.get("version", 0),
         },
+        "item_budget": S.cycle_budget(current_scaffold, domain),
         "signals": {
             "per_task_gap": signals.get("per_task_gap", {}),
-            "all_fail_groups": signals.get("all_fail_groups", {}),
+            "zero_gradient_groups": signals.get("zero_gradient_groups", {}),
             "valid_seen": signals.get("valid_seen", {}),
             "eval_trajectory": eval_trajectory(
                 decision_history, step, (signals.get("valid_seen") or {}).get("avg"),
                 (signals.get("valid_seen") or {}).get("draws")),
-            "train_curve": signals.get("train_curve", {}),
-            "per_instance": signals.get("per_instance", {}),
+            # per_instance stays only where the loop can fill it; an always-empty field described
+            # in the prompt is a claim the data never supports.
+            **({"per_instance": signals["per_instance"]} if signals.get("per_instance") else {}),
         },
-        "failure_trajectories": signals.get("failures", []),
-        "successes_for_contrast": signals.get("successes", []),
+        # The zero-gradient failures, beside what succeeding in that category looks like.
+        # The failures come from ALL-FAIL groups because those are what the scaffold exists
+        # to fix; requiring a same-game success to pair with would have excluded exactly
+        # them. A category with nothing on one side says why rather than going blank.
+        **({"contrastive_traces": signals.get("contrastive_traces", {})} if domain.multi_turn
+           else {"failure_trajectories": signals.get("failures", [])}),
+        # Counted over EVERY failed rollout of the cycle, not over the handful that fit in
+        # the prompt, and a few hundred characters against tens of thousands for traces —
+        # so it survives any trimming the traces get. Gated with the traces it summarises:
+        # the patterns are step-sequence properties (a command reissued, a reply looped),
+        # which a single-turn domain has no steps to compute.
+        **({"failure_patterns": signals.get("failure_patterns", {})} if domain.multi_turn
+           else {}),
         "decision_history": compact_history(decision_history),
     }
 
 
 _SIGNAL_MEANINGS = (
     "WHAT THE SIGNALS MEAN (descriptions, NOT instructions):\n"
-    "- signals.per_task_gap[task] = success of the CURRENT frozen policy on train, "
-    "'bare' (no scaffold) vs 'injected' (current scaffold). The gap (injected - bare) is "
-    "how much the current scaffold helps this policy in-context right now.\n"
-    "- signals.all_fail_groups[task] = how many training rollout groups had EVERY rollout "
-    "fail. A group where all rollouts get the same outcome gives the RL update no gradient, "
-    "so all-fail groups are places the policy currently gets no learning signal.\n"
+    "- signals.per_task_gap[task] = success on the TRAINING rollouts of the last cycles, split by "
+    "whether the injection probability fired for that group: 'bare' (no text) vs 'injected' "
+    "(current text). The gap (injected - bare) is how much the current text changes in-context "
+    "success. Assignment is a hash of the task, independent of its difficulty, so the two sides "
+    "are comparable. Two properties to keep in view: the rollouts span the policies of those "
+    "cycles rather than one frozen policy, and older cycles are down-weighted geometrically, so "
+    "`n_bare` and `n_injected` are EFFECTIVE counts rather than raw ones. A category shows "
+    "gap=null when one side has no rollouts, and `no_injection_reason` or `no_bare_reason` then "
+    "states which of three situations produced it: the scope holds no text, p_task is zero there, "
+    "or p_task is positive but no group happened to fire. The three call for different actions, "
+    "and none of them is a measured gap of zero.\n"
+    "{trace_shape}"
+    "- signals.zero_gradient_groups[task] = of the TRAINING rollout groups in the last cycle, how "
+    "many produced NO GRADIENT. A group is one prompt's rollout_n completions and the update is "
+    "group-relative (advantage = reward minus the group's own mean), so a group whose rollouts "
+    "all score THE SAME contributes nothing — whether they all failed or all succeeded. The "
+    "breakdown `all_fail` / `all_succeed` ships with the total because the two have OPPOSITE "
+    "remedies: all-fail means the instance is out of reach and text may buy a foothold; "
+    "all-succeed means it is already solved and text buys nothing there. `unit` and "
+    "`rollout_n_median` travel with the number so you can see what a group is here.\n"
     "- signals.valid_seen = the held-out standalone success (the objective). Read-only: you "
     "cannot see or optimize the final test set (unseen); this is the validation signal.\n"
     "- signals.eval_trajectory = that same held-out number across ALL cycles so far: `series` "
@@ -151,17 +185,6 @@ _SIGNAL_MEANINGS = (
     "change), `last_delta`, and `best`. The draws are repeats on the SAME weights, so their "
     "spread measures how much a delta can move by chance. All of it is measurement; what the "
     "shape implies is your call.\n"
-    "- signals.per_instance[instance_id] = how the CURRENT policy does on ONE instance, bare: "
-    "how many attempts, what fraction were correct, and mean speedup when correct. "
-    "failure_trajectories is the same set sorted worst-first. These are what a per-instance "
-    "target has to act on — a category mean cannot say WHICH instance is stuck.\n"
-    "- failure_trajectories = the worst instances under the bare prompt, worst first.\n"
-    "- decision_history = YOUR OWN MEMORY across cycles. Each entry records what you proposed "
-    "(summary.text_proposed = the exact wording, kept verbatim for recent cycles; "
-    "summary.diagnosis = your reasoning at the time), whether the A/B gate accepted it "
-    "(verdict accepted/rejected/noop/reverted, with ab.cand_mean vs ab.cur_mean vs ab.bare_mean), "
-    "and what happened to held-out success afterwards (sr_before -> sr_after). A 'rejected' entry "
-    "means that exact wording measured no better than what it would have replaced.\n"
 )
 
 _MECHANISM = (
@@ -172,6 +195,18 @@ _MECHANISM = (
     "- Scopes available in this domain: {scopes}.\n"
     "  'general' text is spliced into every episode; text on a category label is spliced only "
     "into episodes carrying that label. Text on both is spliced together.\n"
+    "- HOW FAR A CHOICE REACHES. The fraction of training rows that carry your text is "
+    "(rows in the chosen scope) x p. The per-category row counts are in the domain facts below, "
+    "so this is arithmetic you can do before you propose. It is worth doing: one category at "
+    "p=0.2 in a six-category set reaches about 3% of training, and even at p={p_max} reaches "
+    "about 8%, while the same p on 'general' reaches six times that. A change that touches 3% of "
+    "rows can still be the right change — but it will not move the held-out curve enough to be "
+    "visible, so do not read a flat curve afterwards as evidence the text was wrong.\n"
+    "- Scope breadth and content specificity are INDEPENDENT choices, and the guidance below to "
+    "be concrete is about content, not about scope. Text can be concrete and still belong on "
+    "'general' — an output contract, a shared convention, a boilerplate shape apply to "
+    "every category and are checkable in {output_unit}. Put text on a category when it "
+    "would be WRONG elsewhere, not merely when it was a category's rollouts that revealed it.\n"
     "- p is per category, in [0, {p_max}]. p={p_max} injects into that fraction of groups, p=0 "
     "nothing (fully withdrawn). {p_max} is a HARD CAP enforced by the system, not a preference: "
     "anything higher is clamped down to it, so at least half of every category's rollout groups "
@@ -182,11 +217,11 @@ _MECHANISM = (
     "- p starts at 0 for every category, i.e. NOTHING is injected until you raise it. Text you "
     "attach is inert while its category's p is 0: to actually train against it you must set a "
     "p_op for that category in the same action. Withdrawing is setting p back toward 0.\n"
-    "- Where the domain says text can be attached to an individual instance, a text_op target of "
-    "`instance:<instance_id>` attaches text to THAT instance only. It is spliced after the "
-    "general and category text, so an instance receives all three. The instance's own injection "
-    "still rides its category's p — attaching text to an instance whose category has p=0 changes "
-    "nothing. At most 40 instance entries are kept; the oldest are dropped.\n"
+    "- Where the domain says text can be attached to an individual instance, an item whose scope "
+    "is `instance:<instance_id>` attaches to THAT instance only. It is spliced after the general "
+    "and category text, so an instance receives all three. The instance's own injection still "
+    "rides its category's p — attaching text to an instance whose category has p=0 changes "
+    "nothing.\n"
     "- You may also intervene on nothing this cycle.\n"
 )
 
@@ -195,13 +230,18 @@ _WHEN_TO_INTERVENE = (
     "\n"
     "What injecting costs, every time it happens:\n"
     "- Context. The spliced block occupies prompt budget the policy would otherwise spend on "
-    "the observation and the admissible-action list.\n"
+    "the problem statement itself.\n"
     "- Exploration. An injected group is a group the policy did NOT explore on its own. You are "
     "spending its rollouts to see what YOUR text elicits instead of what the policy would have "
     "found. When the policy is already finding successes unaided, that trade is a loss.\n"
-    "- Transfer risk. The loss is computed on the bare prompt, so the gradient pushes the "
-    "student toward behaviour that was elicited under text it will never see at evaluation. "
-    "Behaviour the bare policy cannot reproduce is gradient spent on something unreachable.\n"
+    # Deliberately says nothing about WHICH prompt the loss is conditioned on: that differs by
+    # arm and is stated once, in the loss section, from the same variable the trainer reads. This
+    # bullet used to assert the bare-prompt variant unconditionally — carried over from the
+    # ALFWorld arm, which runs it — so on this arm the Teacher was told both that the loss is
+    # computed on the bare prompt AND that it is computed on the prompt actually used.
+    "- Transfer risk. The student is evaluated with the text absent, so behaviour it cannot "
+    "reproduce without the text is gradient spent on something unreachable. How much of that "
+    "risk you are running depends on the loss, described below.\n"
     "\n"
     "The benefit exists where the policy is STUCK — but 'stuck' is not one thing, and the "
     "situations listed above are the forms it takes. Where nothing is stuck, there is little to "
@@ -224,9 +264,9 @@ _WHEN_TO_INTERVENE = (
     "- Declining is cheap for one cycle and not cheap across a run. A run that ends with an empty "
     "scaffold has measured nothing about whether text helps, which is the question it exists to "
     "answer. Weigh a decline against that, not only against the cost of the measurement.\n"
-    "- What you propose is not applied on your say-so: text goes through a paired A/B on the "
-    "frozen policy and is discarded unless it wins. A wrong proposal costs a measurement, not a "
-    "damaged run.\n"
+    # The A/B mechanism itself is stated under HOW YOUR OUTPUT IS USED; only its bearing on the
+    # decision to intervene belongs here.
+    "- A wrong proposal costs a measurement, not a damaged run: the A/B discards it.\n"
     "{p_limits}"
 )
 
@@ -234,20 +274,18 @@ def _p_limits_text():
     """The p rules AS CONFIGURED. Both are switchable per arm, so neither may be hard-coded into
     the prompt: an arm that pins the older rules would otherwise be told it is bound by limits it
     is not, and plan around a constraint that does not exist."""
+    # States only what the caps IMPLY for planning. The caps themselves are in the mechanism
+    # section; repeating the numbers here spent prompt budget saying the same thing twice.
     out = []
     if S.P_MAX_DELTA < S.P_MAX:
-        out.append(
-            f"- p may move at most {S.P_MAX_DELTA} per cycle, up or down. Reaching a high "
-            "injection rate takes several cycles by design, so a category you want to help needs "
-            "a decision made early enough to ramp, not a single large jump.\n")
+        out.append("- Reaching a high injection rate takes several cycles by design, so a "
+                   "category you want to help needs a decision made early enough to ramp.\n")
     if p_gated_by_ab():
-        out.append(
-            "- p edits proposed ALONGSIDE text that then fails its A/B are discarded with that "
-            "text. If you want a p change to survive on its own merits, propose it WITHOUT a "
-            "text edit.\n")
+        out.append("- To let a p change stand on its own merits, propose it WITHOUT a text "
+                   "edit; bundled with text, it dies with a failed A/B.\n")
     if not out:
         return ""
-    return "\nLimits on p you should plan around, enforced by the system:\n" + "".join(out)
+    return "\nWhat the p limits imply for planning:\n" + "".join(out)
 
 _CONTENT_VOCAB = (
     "KINDS OF SCAFFOLD CONTENT (a vocabulary, NOT a recommendation — the text is free-form, so "
@@ -278,13 +316,7 @@ _CONTENT_VOCAB = (
     "way skills waste a cycle. What it can leave behind is a habit, so it transfers relatively "
     "well to the unscaffolded evaluation.\n"
     "\n"
-    "- rubrics: explicit criteria for what a good answer must satisfy. Acts on a different "
-    "failure entirely — a policy producing acceptable work that scores badly, i.e. optimising "
-    "something other than what it is graded on. Says what is being judged, not how to do it, so "
-    "it is useless when the policy simply cannot do the thing: naming a standard does not supply "
-    "the means, and stating criteria invites satisfying them literally. Worth knowing here that "
-    "the student is scored against criteria it is never shown.\n"
-    "\n"
+    "{rubric_kind}"
     "- examples: a worked demonstration of a solved case. Acts on failures of FORM — structure, "
     "API use, boilerplate, output contract — where the policy knows the substance but not the "
     "shape. The most expensive kind in prompt budget, and the one most likely to be copied "
@@ -292,6 +324,17 @@ _CONTENT_VOCAB = (
     "first situation above: rollouts that all imitate one demonstration resemble each other more, "
     "which "
     "can flatten a group rather than spread it.\n"
+    "{hints_kind}"
+    "\n"
+    "These are not modes to select, and nothing stops one text from doing several at once. "
+    "Which is WORTH using is not stated anywhere — that is what the SIGNALS are for.\n"
+)
+
+# Spliced in only where the domain can actually carry it. A kind the mechanism cannot support is
+# not worth describing: the previous version spent ~660 characters explaining hints and then, two
+# paragraphs later, told the Teacher 'hints: NO'. Explaining a tool and then withdrawing it costs
+# prompt budget and invites the Teacher to reason toward something it cannot propose.
+_KIND_HINTS = (
     "\n"
     "- hints: a partial reveal of a known-good solution for a specific instance. Acts on one "
     "instance rather than a class, so its reach is small. What sets it apart is force: revealing "
@@ -299,13 +342,7 @@ _CONTENT_VOCAB = (
     "the surest way to restart a group where nothing succeeds — and the one whose cost is "
     "hardest to avoid. The side effects scale with that force — the policy is "
     "evaluated without the text, so the more of the answer a hint supplies, the more of what it "
-    "learns is that answer rather than the reasoning that reaches it. Only possible where "
-    "reference solutions exist AND text can be attached per instance.\n"
-    "\n"
-    "These are not modes to select, and nothing stops one text from doing several at once.\n"
-    "{availability}"
-    "Which of the available ones is WORTH using is not stated anywhere — that is what the "
-    "SIGNALS are for.\n"
+    "learns is that answer rather than the reasoning that reaches it.\n"
 )
 
 
@@ -363,7 +400,7 @@ _OPTIMIZATION = (
     "them. The advantage is computed WITHIN the group, relative to that group's own mean. So a "
     "group whose rollouts all get the same outcome contributes NOTHING to the update: if every "
     "rollout in a group fails, every advantage in it is zero and no gradient flows from that "
-    "instance at all. signals.all_fail_groups counts exactly those.\n"
+    "instance at all. signals.zero_gradient_groups counts exactly those.\n"
     "\n"
     "2. Where injected text can change the outcome. Because the update is group-relative, text "
     "that turns an all-fail group into a group with at least one success creates learning signal "
@@ -418,7 +455,8 @@ _OPT_LOSS_STANDARD = (
     "did not fire, and every group once p reaches 0. Text that is never withdrawn produces a "
     "student that depends on it. Raising p buys exploration; lowering p is what converts that "
     "exploration into standalone ability. Both are your decision and neither happens on its own.\n"
-    "   - signals.per_task_gap (injected minus bare, same frozen policy) is the size of the crutch "
+    "   - signals.per_task_gap (injected minus bare, from the training rollouts) is the size of "
+    "the crutch "
     "right now: a large gap means much of the behaviour is still context-dependent and withdrawal "
     "has not finished. signals.valid_seen measures what actually survived into the weights.\n"
 )
@@ -445,31 +483,126 @@ def render_domain_facts(domain):
     return "\n".join(lines)
 
 
-def _content_availability(domain):
-    """Which content kinds this domain can physically carry, and why.
+# The hint entry of the item-definition list, spliced in only where the domain can carry one.
+# Listing it unconditionally described an operation `item_budget` does not offer here.
+# The rubrics entry of the content vocabulary, spliced in only where the score comes from
+# criteria the policy is never shown. Where reward is the task's own verifiable outcome the
+# failure mode a rubric acts on does not arise, and describing the kind there offers an
+# operation `item_budget` does not list.
+CONTENT_RUBRICS = (
+    "- rubrics: explicit criteria for what a good answer must satisfy. Acts on a different "
+    "failure entirely — a policy producing acceptable work that scores badly, i.e. optimising "
+    "something other than what it is graded on. Says what is being judged, not how to do it, so "
+    "it is useless when the policy simply cannot do the thing: naming a standard does not supply "
+    "the means, and stating criteria invites satisfying them literally. Worth knowing here that "
+    "the student is scored against criteria it is never shown.\n"
+    "\n"
+)
 
-    Derived from the same two booleans the Teacher is shown rather than written per domain, so
-    it cannot claim a kind the mechanism does not support. Only availability is stated; whether
-    a kind is worth using is left to the signals, which is where the evidence is.
+
+ITEM_DEF_HINT = (
+    "  * hint — ONE switch for the whole scaffold: partial reveal is on or off. When on, "
+        "every injected row receives the leading `alpha` fraction of ITS OWN reference solution, "
+        "and which rows are injected is decided by p, exactly as for the other kinds — so its "
+        "reach is p, not a handful of hand-picked rows. It is the one kind whose CONTENT you do "
+        "not write: the text is each row's own reference, and your only choice is `alpha`, how "
+        "much of it to show. Add it at scope 'general' with an `alpha` in (0, 1]; change the "
+        "amount with `update`, and turn it off with `delete`.\n"
+)
+
+
+def _content_availability(domain):
+    """The `hints` paragraph, or nothing.
+
+    skills / rubrics / examples are text the Teacher composes, so they are available wherever
+    text is — saying so cost four lines that could not have come out any other way. hints is the
+    one kind with a real precondition (a known-good solution must ship with the instance AND text
+    must be attachable to that instance), so it is the only one worth gating. Gating means
+    OMITTING it rather than describing it and then denying it: this domain answers NO, and the
+    Teacher does not need a vocabulary entry it cannot use.
     """
-    lines = ["Which are POSSIBLE here follows from the domain structure above:\n"]
-    lines.append("- skills: YES — any scope holds free-form text.\n")
-    lines.append("- rubrics: YES — a rubric is just text stating what a good answer must "
-                 "satisfy, so any scope can hold one.\n")
-    lines.append("- examples: YES — a worked demonstration is text you compose; it does not "
-                 "require the domain to supply one.\n")
-    if domain.has_reference_solutions and domain.instance_scope:
-        lines.append("- hints: YES — known-good solutions exist AND text can be attached to a "
-                     "single instance, so part of a solution can be revealed for that instance.\n")
-    else:
-        why = []
-        if not domain.has_reference_solutions:
-            why.append("no known-good solution ships with an instance")
-        if not domain.instance_scope:
-            why.append("text cannot be attached to a single instance")
-        lines.append(f"- hints: NO — {' and '.join(why)}. Anything you wrote as a hint would be "
-                     "your own guess at a solution rather than a reveal of a known one.\n")
-    return "".join(lines)
+    return _KIND_HINTS if (domain.has_reference_solutions and domain.instance_scope) else ""
+
+
+_MEMORY = (
+    "YOUR OWN MEMORY (decision_history):\n"
+    "- decision_history is every cycle you have already decided, oldest first. Each entry holds "
+    "what you proposed (summary.text_proposed, the item ops with their EXACT wording), what the "
+    "A/B returned (`ab`), whether it was applied (`accepted_text`, `p_applied`, `verdict`), the "
+    "held-out success measured just before you acted (`sr_before`) and the one measured after "
+    "the next training stretch (`sr_after`, null until it exists).\n"
+    "- The wording is kept verbatim for the most recent cycles and dropped from older ones to "
+    "bound the prompt, so an old entry shows the outcome but not the text.\n"
+    "- It is there so a wording the A/B already refused is not proposed again, and so a decline "
+    "you already made for a stated reason is not re-derived from scratch. Nothing in it is an "
+    "instruction; it is a record of what you did and what happened.\n"
+    "- A cycle marked triage_declined never reached the measurement stage, so its entry carries "
+    "a diagnosis and no A/B.\n"
+)
+
+
+# How behavioural evidence is shaped, and therefore what to call it. A multi-turn domain
+# can pair a success and a failure of the SAME episode step by step; a single-turn one
+# has one answer per attempt and nothing to walk through, so it gets the per-instance
+# failure list instead. Describing the wrong one offers a field that is always empty.
+TRACE_MULTI_TURN = (
+    "- contrastive_traces[category].zero_gradient_failures = up to three GAMES of that "
+    "category that the policy is failing, each shown as that group's longest trajectory — "
+    "the one that used its whole step budget without arriving. Each step is {a: the command "
+    "the environment executed, o: the environment's reply, v: false when the generation "
+    "contained no parseable action}.\n"
+    "  `group_success_rate` on each entry says how many of that group's rollouts succeeded, "
+    "and `zero_gradient` is true when it is 0.0. A zero-gradient group has no reward "
+    "variance, so GRPO produces no gradient from it at all — nothing in training is currently "
+    "able to move it. Those are taken first. When a category has fewer than three of them, "
+    "the remaining slots go to its LOWEST-success-rate groups instead, and a `note` says how "
+    "many of each kind you are looking at.\n"
+    "- contrastive_traces[category].successes_same_category = up to three of the SHORTEST "
+    "successful trajectories the policy produced in that same category this cycle, on "
+    "DIFFERENT games. They are not the same problem as the failures, so do not read them "
+    "step against step; what they show is what arriving in this category looks like — the "
+    "order things happen in, which command finally lands — against trajectories that never "
+    "got there.\n"
+    "- A category may carry `no_success_to_contrast`: the policy solved it zero times this "
+    "cycle, so there is no successful trajectory of it to put beside the failures. "
+    "`n_all_fail_groups` / `n_groups` give the scale behind the three shown — three traces "
+    "out of forty stuck groups and three out of four mean different things.\n"
+    "- failure_patterns[category] = failure modes counted by rule over EVERY failed rollout "
+    "this cycle, not only the ones shown above: a command reissued three or more times and "
+    "covering half the trajectory, an environment reply received three or more times, and the "
+    "share of steps whose generation held no parseable action. These are counts, not "
+    "impressions, and they cover rollouts the traces had no room for.\n"
+
+)
+
+TRACE_SINGLE_TURN = (
+    "- failure_trajectories = the instances this cycle trained on that the bare policy "
+    "scored worst, with their measured correct-rate over the group. One attempt is one "
+    "answer, so there is no step sequence to walk through — what the list tells you is "
+    "WHICH problems the policy is failing, not where inside an episode it went wrong.\n"
+)
+
+
+def kinds_for(domain=None):
+    """Which item kinds THIS domain can carry, in a fixed order.
+
+    Single source for every place the prompt enumerates kinds. Three separate places used to
+    decide this independently — the content vocabulary, the item-definition list, and the JSON
+    output spec — and each had to be gated by hand when a kind became conditional. The output
+    spec was missed twice: it offered ALFWorld a `hint` (which needs reference solutions the
+    domain has none of) and a `rubric` (which needs grading criteria the policy is not shown),
+    both of which validate_item_ops then refuses. Offering an operation the system will reject
+    spends the Teacher's cycle on a proposal that cannot land.
+    """
+    dom = domain or S.CUDA_DOMAIN
+    out = []
+    for k in ("rubric", "skill", "example", "hint"):
+        if k == "rubric" and not dom.hidden_grading_criteria:
+            continue
+        if k == "hint" and not dom.has_reference_solutions:
+            continue
+        out.append(k)
+    return out
 
 
 def render_system_prompt(domain=None, priors=False):
@@ -485,20 +618,29 @@ def render_system_prompt(domain=None, priors=False):
     domain = domain or S.CUDA_DOMAIN
     return (
         "You are the Teacher in an automated RL training run. A weak language-model agent is "
-        "being trained with reinforcement learning (GiGPO). Your job is to shape the text that "
+        "being trained with reinforcement learning. Your job is to shape the text that "
         "is injected into its TRAINING prompts.\n\n"
         "DOMAIN STRUCTURE (facts, not advice):\n"
         + render_domain_facts(domain) + "\n\n"
         + _MECHANISM.format(scopes=domain.scopes(), p_max=S.P_MAX,
-                            p_max_delta=S.P_MAX_DELTA) + "\n"
-        + _CONTENT_VOCAB.format(availability=_content_availability(domain)) + "\n"
+                            p_max_delta=S.P_MAX_DELTA,
+                            output_unit=domain.output_unit) + "\n"
+        + _CONTENT_VOCAB.format(
+            hints_kind=_content_availability(domain),
+            rubric_kind=(CONTENT_RUBRICS
+                         if (domain or S.CUDA_DOMAIN).hidden_grading_criteria else ""))
+        + "\n"
         + _OPTIMIZATION.format(
             loss_section=(_OPT_LOSS_BARE if bare_prompt_loss() else _OPT_LOSS_STANDARD)) + "\n"
-        + _SIGNAL_MEANINGS + "\n"
+        + _SIGNAL_MEANINGS.format(
+            trace_shape=(TRACE_MULTI_TURN if domain.multi_turn else TRACE_SINGLE_TURN))
+        + "\n"
+        + _MEMORY + "\n"
         + _WHEN_TO_INTERVENE.format(p_limits=_p_limits_text()) + "\n"
         + (_PRIORS + "\n" if priors else "")
         + "HOW YOUR OUTPUT IS USED: text changes are accepted only if, on the current frozen "
-        "policy, the new text beats the current text in a paired A/B on train. p changes are "
+        "policy, the new text beats the current text in a paired A/B on the HELD-OUT file — all "
+        "three conditions scored on the same problems at the same checkpoint. p changes are "
         f"capped at {S.P_MAX}"
         + (f" and rate-limited to {S.P_MAX_DELTA} per cycle" if S.P_MAX_DELTA < S.P_MAX else "")
         + ("; p edits submitted together with text that then FAILS its A/B are discarded along "
@@ -507,77 +649,123 @@ def render_system_prompt(domain=None, priors=False):
         + ". Nothing rewinds a regression: there is no revert, so a bad cycle stays in the "
         "curve. You are told this so you understand the loop — decide freely based on the "
         "signals.\n\n"
-        "HOW TO WRITE THE TEXT. There is no length target. Write whatever it takes to be "
-        "unambiguous, and prefer being explicit over being short.\n"
+        "HOW TO WRITE THE TEXT. Be CONCISE. This is a real constraint, not a style note: the "
+        "block you write is spliced on top of a training prompt that is already long, so every "
+        "line of it displaces context the policy would otherwise spend on the problem itself. "
+        "Write the shortest text that is still unambiguous, and cut anything the policy would "
+        "have done anyway. A few precise lines beat a page.\n"
         "- The reader is a small model that already knows the vocabulary. Restating what it knows "
         "buys nothing; the text is only worth its prompt budget where it says something the "
         "policy is not already doing. Look at what the rollouts actually got wrong and address "
         "that, not the topic in general.\n"
-        "- Prefer instructions whose effect you could check by reading one emitted kernel. "
-        "'Handle the reduction tail when the length is not a multiple of the block size' changes "
-        "what gets written; 'optimize memory access patterns' does not.\n"
-        "- Name the concrete thing: the operator, the layout, the launch shape, the failure to "
-        "avoid. Vague text is worse than no text — it costs prompt budget and the A/B gate cannot "
+        "- Prefer instructions whose effect you could check by reading " + domain.output_unit
+        + ". An instruction that changes what the policy emits is worth its space; one that "
+        "names a goal without naming an action is not.\n"
+        "- Name the concrete thing: " + domain.concrete_nouns
+        + ". Vague text is worse than no text — it costs prompt budget and the A/B gate cannot "
         "tell it apart from nothing, so it wastes the cycle it is measured in.\n"
         "- The policy is evaluated with this text ABSENT. Write what teaches a habit it can keep, "
         "not a crutch that only works while the text is there.\n\n"
+        "\nTHE SCAFFOLD IS A SET OF ITEMS, NOT A BLOCK OF TEXT. Each scope holds separately "
+        "addressable entries, each with a stable id (g3, conv7). You add, update or delete them "
+        "one at a time; you never rewrite a scope wholesale. The entries of a scope are spliced "
+        "together, in order, with a blank line between them.\n"
+        "- WHAT COUNTS AS ONE ITEM depends on its kind, and the limits below follow from that:\n"
+        + ("  * rubric — ONE criterion: something that can independently pass or fail. Rubrics "
+           "are naturally a list, so several short ones is the right shape.\n"
+           if (domain or S.CUDA_DOMAIN).hidden_grading_criteria else "")
+        + 
+        "  * skill — ONE rule: a trigger and the action it licenses. The test for whether you "
+        "have written one or two: delete any single sentence and ask whether the rule still "
+        "stands. If it does, that sentence was a second item and belongs in its own entry.\n"
+        "  * example — ONE worked input-to-output demonstration. INDIVISIBLE: half a "
+        "demonstration teaches nothing, so it stays one entry however long it runs. It is also "
+        "the kind that consumes the prompt budget, which is why a scope may hold only one.\n"
+        + (ITEM_DEF_HINT if (domain or S.CUDA_DOMAIN).has_reference_solutions else "")
+        + "- Splitting matters beyond bookkeeping: an item is the smallest thing that can be "
+        "deleted on its own. Two rules fused into one entry can only be removed together, so a "
+        "wrong half drags a right half out with it.\n"
+        "- The exact per-kind size and count limits, which kinds this domain can carry, and how "
+        "many entries you may add or update THIS cycle, are in `item_budget` in the observation. "
+        "An edit over budget is DROPPED and reported — the rest of your action still applies, so "
+        "an over-long list costs you the surplus rather than the whole cycle.\n\n"
         "Return ONLY JSON: {\"diagnosis\": \"<your reasoning>\", "
-        "\"text_ops\": [{\"target\": \"<scope>\", \"text\": \"<the text to attach>\"}], "
+        "\"item_ops\": ["
+        "{\"op\": \"add\", \"scope\": \"<scope>\", \"kind\": \""
+        + "|".join(k for k in kinds_for(domain) if k != "hint") + "\", "
+        "\"text\": \"...\"}, "
+        + ("{\"op\": \"add\", \"scope\": \"general\", \"kind\": \"hint\", \"alpha\": <0..1>}, "
+           if "hint" in kinds_for(domain) else "")
+        + 
+        "{\"op\": \"update\", \"id\": \"<item id>\", \"text\": \"...\"}, "
+        "{\"op\": \"delete\", \"id\": \"<item id>\"}], "
         "\"p_ops\": [{\"task\": \"<category>\", \"p\": <float 0..1>}]}. "
-        "Empty text_ops and empty p_ops means you choose not to intervene this cycle."
+        "Empty item_ops and empty p_ops means you choose not to intervene this cycle."
     )
 
 
-def _balanced_trim(fails, keep_fn):
-    """Drop failures round-robin across task types until `keep_fn` accepts the list.
+def _trim_traces(traces, keep_fn):
+    """Drop one trace at a time, always from whichever category currently has the most.
 
-    Trimming from the tail is what a naive budget cap does, and it is wrong here: the list
-    arrives grouped by task type, and a 50-step ALFWorld failure serialises to ~8k chars, so a
-    160k budget deletes roughly the last 25 of 40 — i.e. entire task types, chosen by nothing
-    but list order. The Teacher then sees failures for the first categories only and cannot
-    tell that from "those categories had no failures". Round-robin keeps every type represented
-    and spends the budget on breadth instead of on whoever sorted first.
+    Trimming from the tail is what a naive budget cap does and it is wrong here: the traces
+    arrive grouped by category, so a budget that fits two thirds of them deletes entire
+    categories chosen by nothing but dict order. The Teacher then sees traces for the first
+    few categories and cannot tell that from "those categories had none". Taking from the
+    largest keeps every category represented for as long as the budget allows, and the
+    weaker evidence (an unpaired failure) goes before a pair.
     """
-    from collections import OrderedDict
-    buckets = OrderedDict()
-    for f in fails:
-        buckets.setdefault((f or {}).get("task_type", "?"), []).append(f)
-    order = []                      # interleave: one per type, then the next of each, ...
-    while any(buckets.values()):
-        for k in list(buckets):
-            if buckets[k]:
-                order.append(buckets[k].pop(0))
-    kept = list(order)
-    while kept and not keep_fn(kept):
-        kept = kept[:-1]            # the tail is now the LEAST-represented type's extras
-    return kept
+    cur = {c: dict(v) for c, v in (traces or {}).items()}
+    while not keep_fn(cur):
+        sizes = {c: len(v.get("zero_gradient_failures") or [])
+                    + len(v.get("successes_same_category") or [])
+                 for c, v in cur.items()}
+        if not sizes or max(sizes.values()) == 0:
+            return {}                       # nothing left to give back; the caller reports it
+        worst = max(sizes, key=lambda c: (sizes[c], c))
+        v = cur[worst]
+        # Successes go first. The zero-gradient failures are the thing the run is about; a
+        # success is context for them, so if only one side can fit it is the failures.
+        if v.get("successes_same_category"):
+            v["successes_same_category"] = v["successes_same_category"][:-1]
+        elif v.get("zero_gradient_failures"):
+            v["zero_gradient_failures"] = v["zero_gradient_failures"][:-1]
+    return cur
+
+
+def _count_traces(traces):
+    return {c: {"failures": len(v.get("zero_gradient_failures") or []),
+                "successes": len(v.get("successes_same_category") or [])}
+            for c, v in (traces or {}).items()}
 
 
 def render_user_prompt(obs):
     """The measured observation packet, trimmed to a char budget on the heavy field.
 
-    A trim is recorded in the packet itself (failure_trajectories_dropped): silently shrinking
-    the Teacher's only view of real behaviour makes "no failures on this task" and "trimmed
-    away" indistinguishable, and the Teacher reasons from that field.
+    A trim is recorded in the packet itself (contrastive_traces_dropped): silently shrinking the
+    Teacher's only view of real behaviour makes "this category had nothing to show" and
+    "trimmed away" indistinguishable, and the Teacher reasons from that field.
+
+    failure_patterns is never trimmed. It is a few hundred characters, it is counted over
+    every rollout rather than the sampled ones, and it is the part that stays true when the
+    traces do not fit.
     """
     body = json.dumps(obs, ensure_ascii=False, default=str)
     budget = _FAIL_CHARS + 40000
-    if len(body) > budget and obs.get("failure_trajectories"):
+    if len(body) > budget and obs.get("contrastive_traces"):
         trimmed = dict(obs)
-        original = list(obs["failure_trajectories"])
-        fails = _balanced_trim(
-            original,
-            lambda cand: len(json.dumps({**trimmed, "failure_trajectories": cand},
+        before = _count_traces(obs["contrastive_traces"])
+        kept = _trim_traces(
+            obs["contrastive_traces"],
+            lambda cand: len(json.dumps({**trimmed, "contrastive_traces": cand},
                                         ensure_ascii=False, default=str)) <= budget)
-        trimmed["failure_trajectories"] = fails
-        if len(fails) < len(original):
-            from collections import Counter
-            trimmed["failure_trajectories_dropped"] = {
-                "kept": len(fails), "of": len(original),
-                "note": "trimmed to a char budget, balanced across task types; "
-                        "absence here does NOT mean the task had no failures",
-                "kept_by_task": dict(Counter((f or {}).get("task_type", "?") for f in fails)),
-                "of_by_task": dict(Counter((f or {}).get("task_type", "?") for f in original)),
+        trimmed["contrastive_traces"] = kept
+        after = _count_traces(kept)
+        if after != before:
+            trimmed["contrastive_traces_dropped"] = {
+                "note": "trimmed to a char budget, taken from the largest category each time; "
+                        "absence here does NOT mean the category had nothing to show. "
+                        "failure_patterns is complete and was counted over every rollout.",
+                "before": before, "after": after,
             }
         body = json.dumps(trimmed, ensure_ascii=False, default=str)
     return "MEASURED STATE (only measurements — infer everything yourself):\n" + body
@@ -651,6 +839,12 @@ _TRIAGE_PROMPT = (
     "convincingly flattened' may be unfalsifiable on this run rather than evidence of progress. "
     "When the held-out signal cannot settle the question, decide on train_rollouts_by_category, "
     "which is sampled orders of magnitude better and does not depend on that curve at all.\n"
+    "- zero_gradient_groups[category] counts the training rollout groups of the last cycle that "
+    "produced no gradient, split into all_fail and all_succeed. A group is one instance's "
+    "rollout_n completions, and the update is group-relative, so a group whose rollouts all score "
+    "the same contributes nothing whatever that score is. A category can hold a moderate success "
+    "rate while most of its instances are silent. The two causes point opposite ways: all_fail "
+    "means the instances are out of reach, all_succeed means they are already solved.\n"
     "\n"
     "Return ONLY JSON: {\"intervene\": true|false, \"why\": \"<one or two sentences>\"}.\n"
 )
@@ -666,7 +860,8 @@ def render_triage_prompt():
 
 def assemble_triage_observation(current_scaffold, eval_traj, decision_history, step,
                                 per_task=None, per_task_n=None, train_rollouts=None,
-                                cycle=None, n_cycles=None, floor_cycles=None):
+                                cycle=None, n_cycles=None, floor_cycles=None,
+                                zero_gradient=None):
     """The cheap observation: only what is already computed. No train-side measurement, which is
     exactly the cost this pre-check exists to avoid.
 
@@ -698,7 +893,16 @@ def assemble_triage_observation(current_scaffold, eval_traj, decision_history, s
         "eval_trajectory": eval_traj,
         "valid_seen_per_task": {t: {"success": v, "n_episodes": per_task_n.get(t)}
                                 for t, v in per_task.items()},
+        # A COUNT, not the budget: this pre-check only decides whether to pay for a measurement,
+        # and how many entries may change is a question for the cycle that actually proposes. What
+        # it does need is how full the scaffold already is — 'nothing has been written yet' and
+        # 'every scope is at capacity' are different reasons to answer the same question.
         "current_scaffold": {
+            # Keys come from the scaffold's OWN items dict, not from scopes_of(scaffold) with no
+            # domain — that call falls back to ALF_DOMAIN and listed ALFWorld task names to a
+            # Teacher training on Triton kernels.
+            "n_items_by_scope": {sc: len(v or [])
+                                 for sc, v in (current_scaffold.get("items") or {}).items()},
             "general_skill": current_scaffold.get("general_skill", ""),
             "skills": current_scaffold.get("skills", {}),
             "p_task": current_scaffold.get("p_task", {}),
@@ -708,6 +912,12 @@ def assemble_triage_observation(current_scaffold, eval_traj, decision_history, s
     }
     if train_rollouts:
         obs["train_rollouts_by_category"] = train_rollouts
+    # Zero-gradient groups are free (already computed from the cycle's training rollouts) and
+    # answer a question the per-category rate cannot: an instance where every rollout scores the
+    # same contributes nothing to the update whatever that score is. A category can hold a
+    # moderate success rate while most of its instances are silent.
+    if zero_gradient:
+        obs["zero_gradient_groups"] = zero_gradient
     if cycle is not None:
         n_declined = sum(1 for d in (decision_history or [])
                          if (d.get("summary") or {}).get("noop"))

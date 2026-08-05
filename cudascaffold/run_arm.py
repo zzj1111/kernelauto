@@ -9,7 +9,7 @@ data change, not a prompt rewrite.
 
 What the Teacher sees each cycle (assembled by observation.assemble_observation):
   signals.per_task_gap[cat]    bare vs injected mean reward on the SAME train rows, this policy
-  signals.all_fail_groups[cat] categories where the reward is 0 (wrong or uncompilable = no
+  signals.zero_gradient_groups[cat] GRPO groups with no reward variance (all-fail or all-succeed):
                                gradient); this domain's equivalent of an all-fail rollout group
   signals.valid_seen           held-out mean reward on test.parquet, never scaffolded
   signals.eval_trajectory      that number across all cycles, with each point's draws
@@ -148,15 +148,34 @@ def build_fns(cfg):
         return A.eval_adapter(ckpt, val_n, cfg)
 
     def signals_fn(ckpt, scaf):
-        return A.signals_adapter(ckpt, scaf, cfg, seed=cfg["base_seed"] + _step_of(ckpt))
+        """Signals WITHOUT a measurement pass.
+
+        The dedicated bare+injected sweep is gone: it was two of the seven Ray+vLLM startups per
+        cycle, and startups are GPU context create/destroy, the operation that wedged this node.
+        Training already runs the same experiment — p_task decides injection per group, by a hash
+        independent of difficulty — so the contrast is free. ARM_SIGNALS_PASS=1 restores the old
+        behaviour for a side-by-side check.
+        """
+        free = cfg.get("_last_signals") or {}
+        if os.environ.get("ARM_SIGNALS_PASS", "0") == "1":
+            sig = A.signals_adapter(ckpt, scaf, cfg, seed=cfg["base_seed"] + _step_of(ckpt))
+            sig["zero_gradient_groups"] = free.get("zero_gradient_groups") or {}
+            sig["per_task_gap_from_training"] = free.get("per_task_gap") or {}
+            return sig
+        return {"per_task_gap": free.get("per_task_gap") or {},
+                "zero_gradient_groups": free.get("zero_gradient_groups") or {},
+                # From the NON-INJECTED training groups, so "worst instances under the bare
+                # prompt" — which is what the observation calls them — stays literally true.
+                "failures": (free.get("failures") or [])[:40],
+                "successes": []}
 
     def measure_ab_fn(ckpt, cur, cand, tasks):
         return A.measure_ab_adapter(ckpt, cur, cand, tasks, cfg,
                                     seed=cfg["base_seed"] + _step_of(ckpt))
 
-    def teacher_fn(obs):
+    def teacher_fn(obs, scaffold=None):
         return T.propose(obs, call_fn=T.openai_call, domain=cfg["domain"],
-                         priors=cfg["teacher_priors"])
+                         priors=cfg["teacher_priors"], scaffold=scaffold)
 
     def triage_fn(obs):
         return T.triage(obs, call_fn=T.openai_call)
@@ -183,6 +202,12 @@ def main(n_cycles=20):
     saved = _load(cfg["state_path"], None)
     if saved and "step" in saved:
         state = {**L.new_state(), **saved}
+        # A scaffold written before items existed has no `items` key, so every id-based edit is
+        # impossible and the observation would show an empty item list beside non-empty injected
+        # text — the Teacher would then "add" what is already being injected. Migration turns each
+        # legacy per-scope string into the one item it always was. Cheap and idempotent, so it
+        # runs on every resume rather than being gated on a version check that could go stale.
+        state["scaffold"] = S.migrate_items(state["scaffold"], cfg["domain"])
         fns["log"](f"[autoscaffold] RESUME {cfg['exp']} at cycle {state.get('cycle')} "
                    f"step={state['step']} scaffold v{state['scaffold'].get('version')} "
                    f"best={state.get('best')}@{state.get('best_step')}")

@@ -15,7 +15,11 @@ import hashlib
 import json
 import os
 
-_MARK_OPEN = "[STRATEGY — injected during training only]"
+# The marker names the block so the policy can tell injected guidance from the problem statement.
+# It used to read "[STRATEGY — injected during training only]"; the clause was removed because the
+# fact it states is about the harness, not about the task, and the policy has no use for it while
+# generating.
+_MARK_OPEN = "[STRATEGY]"
 _MARK_CLOSE = "[END STRATEGY]"
 # Splice ahead of the block that tells the model what to emit, so the guidance is read before the
 # output contract rather than after it. Which phrase opens that block depends on the dataset, so
@@ -80,7 +84,7 @@ def _as_dict(x):
         return {}
 
 
-def render_block(scaffold, level, instance=None):
+def render_block(scaffold, level, instance=None, reference=None):
     """The text this row receives: general + its category's + its own instance's, in that order.
 
     Ordering is general -> category -> instance, i.e. widest to narrowest, so the most specific
@@ -97,7 +101,49 @@ def render_block(scaffold, level, instance=None):
     inst = (scaffold.get("instances") or {}).get(instance) if instance else None
     if inst and str(inst).strip():
         parts.append(str(inst).strip())
+    rev = _reveal(scaffold, reference)
+    if rev:
+        parts.append(rev)
     return "\n\n".join(parts)
+
+
+def hint_alpha(scaffold):
+    """The active partial-reveal fraction, or None. One switch for the whole scaffold."""
+    for it in (scaffold.get("items") or {}).get("general") or []:
+        if it.get("kind") == "hint":
+            try:
+                a = float(it.get("alpha"))
+            except (TypeError, ValueError):
+                return None
+            return a if 0.0 < a <= 1.0 else None
+    return None
+
+
+def _reveal(scaffold, reference):
+    """The leading `alpha` fraction of THIS row's own reference solution, or ''.
+
+    Cut on a line boundary, not a character one: half a line of code is not a partial solution,
+    it is a syntax error, and the point of a reveal is that what is shown is usable as far as it
+    goes. Labelled so the policy can tell a supplied fragment from its own work.
+
+    Without this function `alpha` was stored on the scaffold and read by nothing — the Teacher
+    could set it, the record showed it set, and not one character reached a prompt.
+    """
+    alpha = hint_alpha(scaffold)
+    if not alpha or not reference:
+        return ""
+    lines = str(reference).splitlines()
+    if not lines:
+        return ""
+    keep = max(1, int(round(len(lines) * alpha)))
+    if keep >= len(lines):
+        body = "\n".join(lines)
+        tail = ""
+    else:
+        body = "\n".join(lines[:keep])
+        tail = "\n... (remainder withheld)"
+    return (f"[PARTIAL REFERENCE — the first {int(round(alpha * 100))}% of a known-good "
+            f"solution for THIS task, given during training only]\n{body}{tail}")
 
 
 def splice(prompt, block):
@@ -138,12 +184,15 @@ def build(src_parquet, dst_parquet, scaffold, seed=0, mode="full"):
     extras = df["extra_info"].tolist()
     out, n_inj = [], 0
     per_level = {}
+    fired = {}
     for i, (p, ei) in enumerate(zip(prompts, extras)):
         lv = level_of(ei, df["data_source"].iloc[i] if "data_source" in df.columns else None)
         stat = per_level.setdefault(lv or "unlabelled", [0, 0])
         stat[1] += 1
-        block = render_block(scaffold, lv, task_key(ei, i)) if mode != "none" else ""
+        ref = (ei or {}).get("answer") if hasattr(ei, "get") else None
+        block = render_block(scaffold, lv, task_key(ei, i), ref) if mode != "none" else ""
         fire = bool(block) and (mode == "force" or _fires(task_key(ei, i), lv, scaffold, seed))
+        fired[task_key(ei, i)] = bool(fire)
         if fire:
             p = _splice_row(p, block)
             n_inj += 1
@@ -152,9 +201,15 @@ def build(src_parquet, dst_parquet, scaffold, seed=0, mode="full"):
     df["prompt"] = out
     os.makedirs(os.path.dirname(os.path.abspath(dst_parquet)), exist_ok=True)
     df.to_parquet(dst_parquet, index=False)
+    # `fired` is RECORDED, never recomputed downstream. Injection needs TWO conditions — the coin
+    # (_fires) and the scope actually holding text (bool(block)) — and a consumer that replays only
+    # the coin gets it wrong wherever p is set on a scope with no text. Measured: with p on all six
+    # categories and text on one, replaying the coin alone mislabelled 247 of 600 rows, all of them
+    # un-injected rows counted as injected. That would have told the Teacher the scaffold does
+    # nothing for five categories it was never applied to.
     return {"n_rows": len(df), "n_injected": n_inj,
             "per_level": {k: tuple(v) for k, v in per_level.items()},
-            "dst": dst_parquet}
+            "fired": fired, "dst": dst_parquet}
 
 
 def _splice_row(prompt_cell, block):
