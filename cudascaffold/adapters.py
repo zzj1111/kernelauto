@@ -645,54 +645,22 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
             "failures": failures, "seen_tasks": seen}
 
 
-# Weight applied to a cycle's per_task_gap when accumulating across cycles.
+# NOT IMPLEMENTED: cross-cycle accumulation of per_task_gap with an exponential decay.
 #
-# Within one cycle the observations come from ten consecutive policies, and there the optimal
-# weighting is uniform: measured drift is 0.0005 per step against a sampling standard deviation of
-# 0.036, so the bias a ten-step lag introduces is 6% of the noise and its square is 260x smaller
-# than the variance it would reduce. Across cycles the ratio reverses, and the estimate has to
-# forget.
+# A lambda was derived for it on 2026-08-04 — the local-level model theta_t = theta_{t-1} + w,
+# y_t = theta_t + v, with r measured from three eval draws of ONE checkpoint (0.001915) and q
+# from the cycle-to-cycle differences minus 2r/3 (0.000368), giving a steady-state Kalman gain
+# of 0.524 and a retained weight of 0.476, rounded to 0.8 at the user's instruction.
 #
-# The value follows from the local-level model theta_t = theta_{t-1} + w, y_t = theta_t + v. Both
-# variances are measurable here rather than fitted: r comes directly from the three eval draws of
-# ONE checkpoint (0.001915), and q from the cycle-to-cycle differences minus 2r/3 (0.000368). The
-# steady-state Kalman gain for that ratio is 0.524, so the retained weight is 0.476.
+# The function that applied it was written and never called: nothing accumulated the history it
+# takes, no field carried its output, and the prompt never described it. It was removed on
+# 2026-08-06 rather than left in place, because code that implies a mechanism the run does not
+# have is worse than its absence — the next reader has no way to tell.
 #
-# The construction is the one GAE uses: a family of estimators indexed by how far back they reach,
-# combined by a single exponential weight that trades bias against variance. Policy staleness here
-# occupies the position value-function error occupies there.
-# 0.476 is what the measured q and r give. 0.8 is the value in use: it keeps roughly five cycles
-# of history instead of two, at the cost of a longer lag behind the current policy. The measured
-# drift is small enough that the extra lag stays well under the sampling noise.
-GAP_DECAY = float(os.environ.get("AUTOSCAFFOLD_GAP_DECAY", "0.8"))
-
-
-def accumulate_gap(history, decay=None):
-    """Exponentially weighted per-category bare/injected rates over past cycles.
-
-    `history` is oldest-first: [{cat: {"bare_s","bare_n","inj_s","inj_n"}}, ...]. The most recent
-    cycle carries weight 1, the one before it `decay`, and so on.
-    """
-    d = GAP_DECAY if decay is None else decay
-    acc = {}
-    for age, cyc in enumerate(reversed(history or [])):
-        w = d ** age
-        for cat, v in (cyc or {}).items():
-            a = acc.setdefault(cat, {"bare_s": 0.0, "bare_n": 0.0, "inj_s": 0.0, "inj_n": 0.0})
-            for k in a:
-                a[k] += w * float(v.get(k, 0))
-    out = {}
-    for cat, a in acc.items():
-        b = a["bare_s"] / a["bare_n"] if a["bare_n"] else None
-        i = a["inj_s"] / a["inj_n"] if a["inj_n"] else None
-        out[cat] = {
-            "bare": None if b is None else round(b, 4),
-            "injected": None if i is None else round(i, 4),
-            "gap": None if (b is None or i is None) else round(i - b, 4),
-            "n_bare_eff": round(a["bare_n"], 1), "n_injected_eff": round(a["inj_n"], 1),
-            "decay": d, "n_cycles": len(history or []),
-        }
-    return out
+# per_task_gap is therefore THIS CYCLE'S measurement only, which is what the prompt says.
+# Reinstating the decay needs three things together: the loop keeping per-cycle raw counts in
+# state, the observation carrying the accumulated view, and the prompt saying that the weights
+# are not episode counts.
 
 
 def zero_gradient_groups_from_log(offsets, rollout_n=None):

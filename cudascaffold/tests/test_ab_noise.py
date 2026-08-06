@@ -42,34 +42,62 @@ def _gate(cat, cur, cand, n=N):
                     "candidate": {cat: (cand, n)}}, [cat])
 
 
-def test_no_measured_noise_pair_is_accepted():
-    """The bar is set above every difference two IDENTICAL conditions have been seen to produce."""
-    for cat, a, b in SAME_CONDITION:
-        lo, hi = min(a, b) / N, max(a, b) / N          # worst case: larger side is the candidate
-        r = _gate(cat, lo, hi)
-        assert not r["accept"], (
-            f"{cat}: {lo:.3f} -> {hi:.3f} is noise (same condition, byte-identical prompts) "
-            f"but cleared a margin of {r['margin']:.3f}")
+def test_the_margin_is_off_by_default_and_this_is_what_it_costs():
+    """The default is a strict `>` (NOISE_K=0), restored 2026-08-05 at the user's decision.
+
+    This test does not assert that the decision is right — it records the price. Four of the
+    six pairs below are the SAME condition measured twice over byte-identical prompts, so each
+    is noise by construction, and with no margin four of them would now be ACCEPTED as
+    improvements. Nothing rewinds such a scaffold: the revert gate was removed 2026-07-29, so
+    only the held-out curve will show it, and slowly.
+
+    The margin was removed because its own cost was worse in practice. It scaled as 1/sqrt(n),
+    and n shrank as the Teacher narrowed its proposal: on the ALFWorld arm the Teacher went
+    from 6 scopes to 2 after its first rejection — the behaviour the design wants — and that
+    cut n from 180 to 60 and raised the bar from 6 points to 17. The gate was penalising the
+    Teacher for learning.
+    """
+    assert NOISE_K == 0.0, "the default is a strict >; set ARM_AB_NOISE_K to restore a margin"
+    would_accept = [c for c, a, b in SAME_CONDITION
+                    if _gate(c, min(a, b) / N, max(a, b) / N)["accept"]]
+    assert len(would_accept) == 4, would_accept
 
 
-def test_a_strict_greater_than_would_have_accepted_three_of_them():
-    """Why the margin exists at all: without it the gate is a coin flip on this data."""
+def test_the_calibrated_margin_can_still_be_switched_back_on(monkeypatch):
+    """The calibration survives as a knob rather than as behaviour: K=2.2 was the smallest
+    multiplier that rejected all six same-condition pairs, and it still does."""
+    import importlib
+
+    from cudascaffold import gates
+    monkeypatch.setenv("ARM_AB_NOISE_K", "2.2")
+    importlib.reload(gates)
+    try:
+        for cat, a, b in SAME_CONDITION:
+            lo, hi = min(a, b) / N, max(a, b) / N
+            r = gates.ab_gate({"bare": {cat: (lo, N)}, "current": {cat: (lo, N)},
+                               "candidate": {cat: (hi, N)}}, [cat])
+            assert not r["accept"], f"{cat} cleared a margin of {r['margin']:.3f}"
+    finally:
+        monkeypatch.delenv("ARM_AB_NOISE_K", raising=False)
+        importlib.reload(gates)
+
+
+def test_four_of_the_six_same_condition_pairs_differ_at_all():
+    """The raw measurement the margin was calibrated against, kept whether or not it is on."""
     would = [c for c, a, b in SAME_CONDITION if max(a, b) > min(a, b)]
     assert len(would) == 4, would
-    assert NOISE_K > 1.0, "K=1 was measured to pass two of these four; see ab_gate's docstring"
 
 
-def test_margin_shrinks_with_n_so_the_bar_tightens_as_measurement_improves():
-    small = _gate("m", 0.15, 0.30, n=24)["margin"]
-    large = _gate("m", 0.15, 0.30, n=300)["margin"]
-    assert large < small, (small, large)
-    assert abs(large - small / (300 / 24) ** 0.5) < 0.02, "margin must fall as 1/sqrt(n)"
+def test_with_the_margin_off_the_bar_no_longer_depends_on_n():
+    """This is the point of removing it: the bar used to move with the proposal's breadth."""
+    assert _gate("m", 0.15, 0.30, n=24)["margin"] == 0.0
+    assert _gate("m", 0.15, 0.30, n=300)["margin"] == 0.0
+    assert _gate("m", 0.25, 0.267, n=60)["accept"], "a small gain now passes at small n too"
 
 
-def test_an_effect_worth_adopting_still_passes():
-    """A conservative bar is only useful if it is not an infinite one."""
-    assert _gate("m", 0.15, 0.25, n=300)["accept"], "a 10-point gain at n=300 must be adoptable"
-    assert not _gate("m", 0.15, 0.18, n=300)["accept"], "3 points at n=300 is not resolvable"
+def test_an_effect_worth_adopting_passes():
+    assert _gate("m", 0.15, 0.25, n=300)["accept"]
+    assert _gate("m", 0.15, 0.18, n=300)["accept"], "with no margin, any strict gain passes"
 
 
 def test_ties_and_regressions_never_accept():

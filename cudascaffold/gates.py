@@ -21,9 +21,19 @@ from __future__ import annotations
 
 import os
 
-# How many standard errors of the difference a candidate must clear. Calibrated against six real
-# same-condition A/B pairs, not chosen by preference — see ab_gate's docstring.
-NOISE_K = float(os.environ.get("ARM_AB_NOISE_K", "2.2"))
+# How many standard errors of the difference a candidate must clear.
+#
+# DEFAULT 0 — a strict `>` with no margin, which is the rule this project originally locked.
+# The margin was added on 2026-08-03 after measuring that two passes over BYTE-IDENTICAL
+# prompts differ (see ab_gate's docstring for the numbers), and removed again on 2026-08-05
+# at the user's decision. What the margin cost in practice: the Teacher narrowed from 6
+# scopes to 2 after its first rejection, which is the behaviour the design wants, and that
+# narrowing cut the A/B's n from 180 to 60 and raised the bar it had to clear from 6 points
+# to 17 — so the gate punished the Teacher for learning. Removing the margin removes that
+# coupling; the cost is that same-condition noise can now be accepted.
+#
+# Set ARM_AB_NOISE_K=2.2 to restore the calibrated margin.
+NOISE_K = float(os.environ.get("ARM_AB_NOISE_K", "0"))
 
 
 def _weighted_mean(per_task, tasks):
@@ -46,11 +56,12 @@ def ab_gate(measure, tasks):
     tasks:   the touched tasks (from scaffold.touched_tasks); the comparison is aggregated
              over exactly these (a 'general' edit touches all tasks).
 
-    ACCEPT iff the candidate beats the current text by more than the sampling noise of the
-    comparison itself.
+    ACCEPT iff the candidate beats the current text. With NOISE_K=0 (the default) that is a
+    strict `>`; a positive NOISE_K additionally requires the difference to clear that many
+    standard errors of the comparison.
 
-    The margin is not a tunable preference — it exists because a strict `>` was measured to be a
-    coin flip. Generation is not reproducible run to run (see measure_ab_adapter): at n=24 per
+    What a strict `>` gives up, measured rather than assumed. Generation is not reproducible
+    run to run (see measure_ab_adapter): at n=24 per
     category, two passes over BYTE-IDENTICAL prompts differed by up to 6 of 24 tasks, so a bare
     `>` accepted or rejected on differences the measurement cannot resolve. Since both arms are
     Bernoulli over the same rows, the standard error of the DIFFERENCE is
@@ -82,10 +93,12 @@ def ab_gate(measure, tasks):
     proposal actually touched. Together they put the bar near 6 points, against the ~23 that a
     strict `>` at n=24 could honestly resolve.
 
-    K is deliberately conservative because the errors are not symmetric. A rejected proposal costs
-    one cycle — the Teacher re-proposes next cycle with the same evidence. An accepted one is
-    permanent: the revert_gate was removed 2026-07-29, so nothing rewinds a scaffold that turns out
-    to be noise, and it keeps being injected into half the training prompts for the rest of the run.
+    The errors are not symmetric, which is why a margin was tried at all. A rejected proposal
+    costs one cycle — the Teacher re-proposes next cycle with the same evidence. An accepted one
+    is permanent: the revert_gate was removed 2026-07-29, so nothing rewinds a scaffold that
+    turns out to be noise, and it keeps being injected for the rest of the run. With the margin
+    off, the held-out curve is the only thing that will show such a scaffold was noise, and it
+    will show it slowly.
 
     No retries: a rejected proposal is discarded and the current scaffold trains on unchanged; the
     Teacher re-proposes next cycle.
