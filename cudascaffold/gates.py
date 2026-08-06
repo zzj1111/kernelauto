@@ -115,12 +115,22 @@ def ab_gate(measure, tasks):
     margin = NOISE_K * ((cur_mean * (1 - cur_mean) / cur_n)
                         + (cand_mean * (1 - cand_mean) / cand_n)) ** 0.5
     accept = cand_mean > cur_mean + margin
+    # The bare arm is measured on the same games and does NOT enter the decision — the rule is
+    # candidate vs current, deliberately. But a third of the A/B's cost buys this number, and it
+    # can say something the rule cannot see: an accepted candidate that is BELOW bare is text
+    # which loses to no text, made permanent (nothing rewinds a scaffold since the revert gate
+    # was removed). It has happened — alf_scaffold_kl0 c1 accepted 0.111 over 0.100 with bare at
+    # 0.122. Flagged, not vetoed: the verdict stays exactly what it was, and the Teacher, whose
+    # job the content is, gets to see it in decision_history.
+    below_bare = bool(accept and cand_mean < bare_mean)
     reason = (f"candidate {cand_mean:.3f} vs current {cur_mean:.3f} "
               f"(bare {bare_mean:.3f}, margin {margin:.3f}, n {cur_n}+{cand_n}) "
-              f"-> {'ACCEPT' if accept else 'reject'}")
+              f"-> {'ACCEPT' if accept else 'reject'}"
+              + ("  [WARNING: accepted text scores BELOW the no-text arm — it beats the current "
+                 "scaffold but loses to having no scaffold at all]" if below_bare else ""))
     return {"accept": accept, "reason": reason, "cand_mean": round(cand_mean, 3),
             "cur_mean": round(cur_mean, 3), "bare_mean": round(bare_mean, 3),
-            "margin": round(margin, 4), "n": cur_n + cand_n}
+            "below_bare": below_bare, "margin": round(margin, 4), "n": cur_n + cand_n}
 
 
 def update_best(best, best_step, sr, step):
