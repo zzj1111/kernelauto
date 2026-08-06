@@ -1,9 +1,13 @@
 """The auto-scaffold control loop.
 
 One cycle = train K steps with the current scaffold -> eval standalone on valid_seen
-(VAL_N draws) -> triage (is this cycle worth measuring?) -> gather train signals ->
-Teacher proposes -> A/B gate on text -> apply accepted text + any p change -> write scaffold.
+(VAL_N draws) -> gather train signals -> Teacher proposes -> A/B gate on text ->
+apply accepted text + any p change -> write scaffold.
 There is no revert: a regression stays in the curve (see run_cycle).
+
+An optional triage pre-check can sit before the signals, asking whether the cycle is worth
+measuring at all. It is OFF by default — the measurement it skipped stopped being expensive
+when signals became a read of the training rollouts. See the note in decide().
 
 All heavy/side-effecting work is injected as functions so this module is pure control
 flow and unit-testable with mocks:
@@ -21,14 +25,39 @@ import copy
 import os
 
 # Ask the Teacher whether a cycle is worth measuring before paying for the measurement.
-# Default ON; set to 0 to restore the old unconditional-signals behaviour.
-TRIAGE_ENABLED = os.environ.get("AUTOSCAFFOLD_TRIAGE", "1") not in ("0", "false", "False")
+# Default OFF: the measurement it skipped is free now, so a decline only costs proposals.
+# See the note at the call site in decide(). Set to 1 to restore it.
+TRIAGE_ENABLED = os.environ.get("AUTOSCAFFOLD_TRIAGE", "0") not in ("0", "false", "False")
 
 from . import scaffold as S
 from . import gates
 from . import observation
 from .observation import assemble_observation, p_gated_by_ab
 from .teacher import propose as default_teacher
+from .teacher import UNREACHABLE_NOTE
+
+
+def _mark_unreachable(state, note, log, cyc):
+    """Count consecutive cycles in which the Teacher could not be reached, and say so loudly.
+
+    A dead key, an exhausted quota or a severed network leaves exactly the trace a Teacher that
+    read the signals and declined leaves: an empty scaffold and a run that finishes at full
+    length. One of those is a result; the other is an outage. Nothing here can fix the outage, and
+    stopping would discard training that is still the plain-RL control — so the loop continues and
+    refuses to let the condition pass quietly, in the log and in the state that the journal and
+    any later report read from.
+    """
+    n = state.get("teacher_unreachable_cycles", 0) + 1 if UNREACHABLE_NOTE in (note or "") else 0
+    state["teacher_unreachable_cycles"] = n
+    if n:
+        bar = "=" * 72
+        log(f"[c{cyc}] {bar}\n"
+            f"[c{cyc}] TEACHER UNREACHABLE for {n} consecutive cycle(s): {note}\n"
+            f"[c{cyc}] Training and eval continue, but NO scaffold can be proposed while this "
+            f"lasts. A run that finishes this way is a plain-RL control, NOT evidence that text "
+            f"does not help. Check OPENAI_API_KEY / quota / network.\n"
+            f"[c{cyc}] {bar}")
+    return n
 
 
 def new_state(step0=0, scaffold=None):
@@ -166,22 +195,32 @@ def decide(state, fns, cfg, ckpt, sr, ev, cyc):
     log = fns.get("log", lambda *a: None)
     ev = ev or {}
 
-    # 4b) Cheap pre-check BEFORE the expensive part. signals_fn is a full bare+injected pass over
-    # the training set and, with the A/B that may follow, costs about as much wall-clock as the
-    # training it sits between (~85 min/cycle vs ~44 min of training, measured on
-    # alf_scratch150_pcap). Paying that to be told "no change" is pure waste, and the Teacher can
-    # tell whether the curve has stalled from the held-out series alone — which is already
-    # computed. So ask first, and only measure if the answer is yes.
-    # Fails OPEN: teacher.triage returns True on any error, so a broken pre-check degrades to the
-    # old behaviour (measure every cycle) rather than silently freezing the scaffold.
+    # 4b) OFF by default since 2026-08-06 — the cost it existed to avoid is gone.
     #
-    # A floor sits under the pre-check. The previous run declined all twenty cycles and finished
-    # with an empty scaffold, having measured nothing about whether text helps — the one question
-    # the run exists to answer. Every single decline was defensible in isolation; the failure was
-    # that "not yet" has no cost until the run is over. `intervene_floor_cycles` bounds how long
-    # the scaffold may stay empty: past it the measurement is taken regardless, and the Teacher is
-    # asked what to write rather than whether to look. It does NOT force a scaffold — propose()
-    # may still decline, and anything it proposes still has to win the A/B.
+    # The pre-check was worth its own GPT call when signals_fn meant a full bare+injected sweep on
+    # a frozen checkpoint: ~85 min/cycle against ~44 min of training (alf_scratch150_pcap). Being
+    # told "no change" after paying that was pure waste, so it was cheaper to ask first.
+    #
+    # signals_fn now reads the rollouts training already wrote, between two byte offsets. It costs
+    # milliseconds. The only expensive thing left downstream is the A/B, and the A/B runs ONLY if
+    # the Teacher proposes text — so what a decline still buys is exactly the cycles where the
+    # Teacher WOULD have proposed something. That is not a saving, it is the experiment being
+    # suppressed: the run exists to find out whether Teacher-written text helps, and a decline
+    # removes a chance to find out while the measurement it avoids is free.
+    #
+    # It is also redundant. propose() can already decline, records its diagnosis, and decides with
+    # strictly more information — triage never sees per_task_gap, contrastive_traces or
+    # failure_patterns, which are the signals the question turns on.
+    #
+    # The record: alf_scratch200_stdloss declined 17 of 20 cycles and finished with an empty
+    # scaffold, having measured nothing about the thing it was run to measure. Every decline was
+    # defensible in isolation; the failure was that "not yet" costs nothing until the run is over.
+    # `intervene_floor_cycles` was added to bound that, and is kept because it still applies when
+    # the pre-check is switched back on.
+    #
+    # AUTOSCAFFOLD_TRIAGE=1 restores it, for a run where the A/B budget matters more than
+    # proposal coverage. Fails OPEN when on: teacher.triage returns True on any error, so a
+    # broken pre-check degrades to measuring rather than to silently freezing the scaffold.
     floor = cfg.get("intervene_floor_cycles")
     scaffold_empty = not S.has_text(state["scaffold"])
     forced = bool(floor) and scaffold_empty and cyc > floor
@@ -199,6 +238,10 @@ def decide(state, fns, cfg, ckpt, sr, ev, cyc):
             zero_gradient=cfg.get("_last_zero_gradient")))
         log(f"[c{cyc}] triage: {'measure' if go else 'SKIP'} — {why}")
         if not go:
+            # triage fails CLOSED on an unreachable Teacher, so its decline is the other way an
+            # outage can end a cycle. Same counter, same banner — the condition must not depend
+            # on which of the two calls happened to be the one that could not get through.
+            _mark_unreachable(state, why, log, cyc)
             state["decision_history"].append({
                 "cycle": cyc, "step": state["step"],
                 "summary": {"noop": True, "triage_declined": True, "diagnosis": why},
@@ -222,14 +265,14 @@ def decide(state, fns, cfg, ckpt, sr, ev, cyc):
         action, note = fns.get("teacher_fn", default_teacher)(obs)
     log(f"[c{cyc}] teacher: {note}; edits={_summary(action)['text_edits']} p={_summary(action)['p_edits']}")
 
+    _mark_unreachable(state, note, log, cyc)
+
     if S.is_noop(action):
-        # Record WHY. This branch is reached only after the signals pass has already been paid
-        # for (a full bare+injected sweep, ~35 min of GPU here), so dropping the Teacher's
-        # reasoning threw away the one artefact that measurement bought. The cheap
-        # triage-declined branch above has always stored its `diagnosis`; this one did not, which
-        # is why cycle 10's decision to do nothing left no trace of what it saw. `note` is
-        # carried too: it distinguishes a Teacher that deliberately declined ("ok") from one
-        # whose output failed validation and was coerced to a no-op.
+        # Record WHY. The signals are free now, but the Teacher's reading of them is not: this is
+        # the only place a cycle's diagnosis is written down, and dropping it left cycle 10's
+        # decision to do nothing with no trace of what it saw. `note` is carried too — it
+        # distinguishes a Teacher that deliberately declined ("ok") from one whose output failed
+        # validation, and from one that could not be reached at all (below).
         log(f"[c{cyc}] teacher declined: {(action.get('diagnosis') or '(no diagnosis)')[:300]}")
         state["decision_history"].append({"cycle": cyc, "step": state["step"],
                                           "summary": {"noop": True, "note": note,

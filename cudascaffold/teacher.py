@@ -19,6 +19,10 @@ MODEL = os.environ.get("AUTOSCAFFOLD_TEACHER_MODEL", "gpt-5.5")
 # makes the Teacher decline every cycle for a reason nothing reports.
 DEFAULT_KEY_FILE = os.environ.get("AUTOSCAFFOLD_OPENAI_KEY_FILE") or None
 NOOP = {"diagnosis": "", "item_ops": [], "p_ops": []}
+# Stable marker the loop counts on. Both propose() and triage() prefix their note with it when the
+# Teacher could not be reached at all, so "it declined" and "it was never asked" stay separable in
+# the journal and in the log. Changing the wording changes what loop.py detects.
+UNREACHABLE_NOTE = "teacher unreachable"
 
 
 def _as_item_ops(raw, scaffold, domain):
@@ -90,12 +94,21 @@ def propose(obs, call_fn=openai_call, domain=None, priors=False, scaffold=None):
 
     `scaffold` is the live scaffold the ops will be applied to; validation needs it to resolve
     the item ids an update/delete names.
+
+    A failure that means the Teacher CANNOT be reached — dead key, exhausted quota, no network —
+    is marked with UNREACHABLE_NOTE so the loop can count it. Without that mark the two failures
+    that matter are indistinguishable in the note: a Teacher that answered and chose not to act,
+    and a Teacher that was never asked because the key died. Both leave the scaffold empty and
+    the run finishes at full length as plain RL, which reads as "text did not help" — the null
+    result this project is most at risk of publishing by accident.
     """
     system = O.render_system_prompt(domain, priors=priors)
     user = O.render_user_prompt(obs)
     try:
         raw = call_fn(system, user)
     except Exception as e:  # network / parse / auth — degrade to no-op, never crash
+        if teacher_unreachable(e):
+            return dict(NOOP), f"{UNREACHABLE_NOTE} ({str(e)[:150]}) -> no-op"
         return dict(NOOP), f"teacher call failed ({str(e)[:150]}) -> no-op"
     return normalize(raw, domain, scaffold=scaffold)
 
@@ -136,7 +149,7 @@ def triage(obs, call_fn=openai_call):
         raw = call_fn(O.render_triage_prompt(), json.dumps(obs, ensure_ascii=False)[:60000])
     except Exception as e:
         if teacher_unreachable(e):
-            return False, (f"teacher unreachable ({str(e)[:120]}) -> skipping the signals pass; "
+            return False, (f"{UNREACHABLE_NOTE} ({str(e)[:120]}) -> skipping the signals pass; "
                            f"training and eval continue on the current scaffold")
         return True, f"triage call failed ({str(e)[:120]}) -> measuring anyway"
     if not isinstance(raw, dict) or not isinstance(raw.get("intervene"), bool):

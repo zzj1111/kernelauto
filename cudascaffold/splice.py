@@ -108,7 +108,21 @@ def render_block(scaffold, level, instance=None, reference=None):
 
 
 def hint_alpha(scaffold):
-    """The active partial-reveal fraction, or None. One switch for the whole scaffold."""
+    """The active partial-reveal fraction, or None. One switch for the whole scaffold.
+
+    DORMANT, deliberately: no configured domain sets has_reference_solutions, so no Teacher can
+    create a `hint` item and this returns None on every real run. Each domain says why in its own
+    definition — ALFWorld exposes no solution trace, and on both kernel arms `extra_info.answer`
+    is the PyTorch reference to be BEATEN, not a fast kernel worth revealing. Revealing it would
+    also cost the arm its zero-leakage claim, which is part of how the method is positioned.
+
+    Kept rather than deleted because it is wired end to end and verified so: flip the flag on a
+    domain and the kind validates, the prompt offers it, and the leading alpha fraction reaches
+    the prompt cut on a line boundary. That is the difference between this and accumulate_gap,
+    which was removed — a capability with no current user is not the same as a mechanism that
+    never ran. Stated here because the docstrings below describe live behaviour, and a reader
+    should not conclude that reveals are happening in these runs.
+    """
     for it in (scaffold.get("items") or {}).get("general") or []:
         if it.get("kind") == "hint":
             try:
@@ -189,7 +203,11 @@ def build(src_parquet, dst_parquet, scaffold, seed=0, mode="full"):
         lv = level_of(ei, df["data_source"].iloc[i] if "data_source" in df.columns else None)
         stat = per_level.setdefault(lv or "unlabelled", [0, 0])
         stat[1] += 1
-        ref = (ei or {}).get("answer") if hasattr(ei, "get") else None
+        # _as_dict, not hasattr: extra_info is a dict in both current dumps, but level_of and
+        # task_key on the two lines around this one both decode a JSON string, and a dump that
+        # stored it as text would leave those two working while the reference silently became
+        # None — a reveal that stops happening without anything reporting it.
+        ref = _as_dict(ei).get("answer")
         block = render_block(scaffold, lv, task_key(ei, i), ref) if mode != "none" else ""
         fire = bool(block) and (mode == "force" or _fires(task_key(ei, i), lv, scaffold, seed))
         fired[task_key(ei, i)] = bool(fire)
