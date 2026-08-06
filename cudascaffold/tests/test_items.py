@@ -209,3 +209,24 @@ if __name__ == "__main__":
             print(f"  FAIL {name}: {e}")
     print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     sys.exit(1 if fails else 0)
+
+
+def test_every_state_field_the_loop_writes_survives_a_restart():
+    """loop.py is shared with the ALFWorld arm; STATE_KEYS is not. A field the shared loop starts
+    writing is persisted by whichever arm was edited and silently reset by the other on every
+    restart — and the watchdog restarts routinely, so the loss is production behaviour, not an
+    edge case. This arm was already carrying train_rollouts when the other had lost it."""
+    import os
+    import re
+    from cudascaffold import loop as L, run_arm as R
+
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "loop.py")).read()
+    written = set(re.findall(r'state\[\s*["\']([a-z_]+)["\']\s*\]\s*=', src))
+    written |= set(re.findall(r'state\.setdefault\(\s*["\']([a-z_]+)["\']', src))
+    lost = sorted(written - set(R.STATE_KEYS))
+    assert not lost, f"loop.py writes {lost}; STATE_KEYS does not persist them"
+    fresh = set(L.new_state(0))
+    assert fresh == set(R.STATE_KEYS), (
+        f"only in new_state: {sorted(fresh - set(R.STATE_KEYS))}, "
+        f"only in STATE_KEYS: {sorted(set(R.STATE_KEYS) - fresh)}")

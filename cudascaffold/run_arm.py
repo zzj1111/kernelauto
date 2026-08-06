@@ -118,7 +118,8 @@ def default_cfg():
 # that memory to one cycle, so a restart quietly costs the pre-check the evidence it was given the
 # series for. Restarts are not rare here — the watchdog does them, and so does every code change.
 STATE_KEYS = ("cycle", "step", "scaffold", "sr_history", "best", "best_step",
-              "decision_history", "last_eval", "train_rollouts")
+              "decision_history", "last_eval", "train_rollouts",
+              "teacher_unreachable_cycles")
 
 
 def _load(path, default):
