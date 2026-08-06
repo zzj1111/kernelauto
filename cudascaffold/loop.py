@@ -73,8 +73,9 @@ def new_state(step0=0, scaffold=None):
         "last_eval": None,          # the eval behind sr_history[-1]; lets a restart prime (see run)
         # Both of these are series that only mean anything ACROSS cycles, and both were created
         # lazily further down — so they were absent from STATE_KEYS and wiped by every restart,
-        # which the watchdog performs routinely. train_rollouts is kept "as a series so stuck is
-        # visible as a trend"; a trend that resets on restart is not one. And an outage counted
+        # and start.sh's chain restarts the arm until ARM_TARGET_STEP is reached. train_rollouts
+        # is kept "as a series so stuck is visible as a trend"; a trend that resets on restart is
+        # not one, and it reset on every one. And an outage counted
         # from zero after each restart reports "1 consecutive cycle" forever while the key stays
         # dead. Declared here so the persisted set and the created set cannot drift apart.
         "train_rollouts": [],       # last 12 cycles of per-category training outcomes
