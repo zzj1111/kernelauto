@@ -909,7 +909,13 @@ def bench(
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     pid = os.getpid()
-    log_path = os.path.join(log_dir, f"bench_{ts}_pid{pid}.jsonl")
+    # One file per PROCESS PER DAY, not per rollout. The flat per-rollout layout put ~30k files
+    # in one directory on this filesystem, where merely listing it takes over two minutes — and
+    # it grows for the life of the project because nothing prunes it. Sharding by day bounds the
+    # directory and makes old logs deletable as a unit; keeping the file per-pid keeps concurrent
+    # runners off each other's appends. Every record still carries its own `ts`, so nothing that
+    # was in the filename is lost. Nothing reads these files — they are a forensic trail.
+    log_path = os.path.join(log_dir, "bench", ts[:8], f"pid{pid}.jsonl")
 
     def _log(record: dict) -> None:
         record.setdefault("ts", ts)
