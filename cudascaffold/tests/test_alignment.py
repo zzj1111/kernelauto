@@ -26,24 +26,32 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import sys
 
-sys.path.insert(0, "/mnt/data1/zha00175/StitchCUDA")
+# The repo this file lives in, not the machine it was written on: the suite has to run from a
+# fresh clone (and did not — every path below named one absolute checkout).
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, REPO)
 
-import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+
+pd = pytest.importorskip("pandas", reason="the alignment checks read the real parquets")
 
 from cudascaffold import gates as G, observation as O, scaffold as S, splice as SP  # noqa: E402
 
 TRI = O.render_triage_prompt()
 
+_DATA = os.environ.get("ARM_DATASET_ROOT", os.path.join(REPO, "dataset"))
+
 # (domain, train parquet, held-out parquet). Held-out may be None where the arm has none yet.
 ARMS = [
     (S.CUDA_DOMAIN,
-     "/mnt/data1/zha00175/StitchCUDA/dataset/CudaForge/train_new_clean.parquet",
-     "/mnt/data1/zha00175/StitchCUDA/dataset/CudaForge/test.parquet"),
+     os.path.join(_DATA, "CudaForge", "train_new_clean.parquet"),
+     os.path.join(_DATA, "CudaForge", "test.parquet")),
     (S.TRITON_DOMAIN,
-     "/mnt/data1/zha00175/StitchCUDA/dataset/Triton/train.parquet",
-     "/mnt/data1/zha00175/StitchCUDA/dataset/Triton/test.parquet"),
+     os.path.join(_DATA, "Triton", "train.parquet"),
+     os.path.join(_DATA, "Triton", "test.parquet")),
 ]
 
 

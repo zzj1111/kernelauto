@@ -27,6 +27,10 @@ import pytest
 CORE = ("scaffold.py", "splice.py", "observation.py", "teacher.py", "gates.py", "loop.py")
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The peer checkout is machine-specific by nature, so the default is only a convenience for the
+# box this was written on; every other machine sets AUTOSCAFFOLD_PEER or gets a skip. It points
+# at the ALFWorld arm that was FROZEN and rebuilt elsewhere, so a mismatch here now means "the
+# peer moved on", not necessarily "this arm drifted" — check which side changed before copying.
 OTHER = os.environ.get("AUTOSCAFFOLD_PEER",
                        "/mnt/data1/zha00175/verl-agent/agent_system/skill_opt/autoscaffold")
 

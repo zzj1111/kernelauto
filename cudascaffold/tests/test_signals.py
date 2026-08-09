@@ -13,7 +13,8 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, "/mnt/data1/zha00175/StitchCUDA")
+# The repo this file lives in, not the machine it was written on.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from cudascaffold.adapters import cat_of_level, per_category_from_log  # noqa: E402
 
