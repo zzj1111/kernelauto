@@ -657,6 +657,28 @@ def _normalize_rubric_total_4_to_20(total: int) -> float:
     return (total - 4) / 16.0
 
 
+def _as_flag(v) -> Optional[bool]:
+    """Parse a JSON-ish boolean strictly. None means "the judge did not say".
+
+    The rubric arrives as free-form JSON from an LLM, and this one field can zero a reward
+    outright, so it is worth being exact about what counts as true. bool() cannot be used: every
+    non-empty string is truthy, which makes the string "false" mean True.
+    """
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, str):
+        t = v.strip().strip('"').strip("'").lower()
+        if t in ("true", "yes", "1"):
+            return True
+        if t in ("false", "no", "0", ""):
+            return False
+    return None
+
+
 def _default_neutral_rubric(data_source: str) -> Dict[str, Any]:
     """
     Neutral rubric that does NOT affect final reward:
@@ -715,7 +737,17 @@ def _compute_final_reward(
         return base, dbg
 
     dbg["rubric_used"] = True
-    major_hacking = bool(rubric_obj.get("major_hacking", False))
+    # NOT bool(): this flag hard-zeroes the reward, and it arrives as free-form JSON from an LLM.
+    # Every non-empty string is truthy in Python, so bool("false") is True — a judge that renders
+    # the field as a quoted "false" instead of a bare false would zero every correct, fast kernel
+    # it looks at, and the debug log would call each one reward hacking. The prompt asks for a
+    # JSON boolean; accept that, accept the obvious string spellings, and treat anything else as
+    # not-flagged, because the safe direction for an unparseable flag is to leave the measured
+    # reward alone rather than to destroy it.
+    major_hacking = _as_flag(rubric_obj.get("major_hacking", False))
+    if major_hacking is None:
+        dbg["major_hacking_unparsed"] = repr(rubric_obj.get("major_hacking"))
+        major_hacking = False
     dbg["major_hacking"] = major_hacking
     if major_hacking:
         dbg["gate"] = "major_hacking"

@@ -515,6 +515,11 @@ def compare_and_bench_inline(
             with ctx:
                 input_errs: List[Dict[str, float]] = []
                 inp0: Optional[List[Any]] = None
+                # Set by the comparison loop when the candidate's output cannot be compared at
+                # all, as opposed to being merely inaccurate. Both are hard failures: they must
+                # not reach the tolerance gate, whose `>` comparisons are False against NaN.
+                nonfinite_output: Optional[Dict[str, float]] = None
+                shape_mismatch: Optional[Tuple[tuple, tuple]] = None
 
                 t0 = _now_ms()
                 for i in range(int(max(num_inputs, 1))):
@@ -551,12 +556,59 @@ def compare_and_bench_inline(
                     if ref_t.dtype != tst_t.dtype:
                         tst_t = tst_t.to(ref_t.dtype)
 
+                    # Shapes must match before subtracting. Broadcasting turns a
+                    # wrong-shaped output into a silent comparison against a different
+                    # tensor rather than a failure.
+                    if tuple(tst_t.shape) != tuple(ref_t.shape):
+                        shape_mismatch = (tuple(tst_t.shape), tuple(ref_t.shape))
+                        break
+
                     diff = (tst_t - ref_t).abs()
                     max_err = float(diff.max().item()) if diff.numel() > 0 else 0.0
                     mean_err = float(diff.mean().item()) if diff.numel() > 0 else 0.0
+                    # A NaN anywhere in the candidate output makes both aggregates NaN, and the
+                    # tolerance gate below is a `>` comparison — every comparison with NaN is
+                    # False, so the failure branch would be SKIPPED and an all-NaN kernel would
+                    # be reported correct with a real speedup. That is the worst possible
+                    # direction for the error: skipping the numerical work makes a kernel both
+                    # more NaN-prone AND faster, so RL would actively select for it. Inf is
+                    # already caught (inf > tol is True); NaN is the hole, so name it as its own
+                    # failure rather than letting it flow into the comparison.
+                    if not (math.isfinite(max_err) and math.isfinite(mean_err)):
+                        nonfinite_output = {"max_abs_err": max_err, "mean_abs_err": mean_err}
+                        break
                     input_errs.append({"max_abs_err": max_err, "mean_abs_err": mean_err})
 
                 timings["forward_multi_inputs"] = _now_ms() - t0
+
+                # Decided BEFORE the tolerance gate, because that gate cannot express them: a
+                # NaN error defeats every `>` comparison, and a shape mismatch never reaches a
+                # comparison at all.
+                if nonfinite_output is not None or shape_mismatch is not None:
+                    res = {
+                        "ok": True,
+                        "correct": False,
+                        "kind": KIND_CORRECTNESS,
+                        "message": (
+                            f"Non-finite output error {nonfinite_output}"
+                            if nonfinite_output is not None else
+                            f"Output shape {shape_mismatch[0]} != reference {shape_mismatch[1]}"),
+                        "max_abs_err_mean": (nonfinite_output or {}).get("max_abs_err"),
+                        "mean_abs_err_mean": (nonfinite_output or {}).get("mean_abs_err"),
+                        "per_input_errs": input_errs,
+                        "speedup": 0.0,
+                        "device": str(dev),
+                        "timings_ms": timings,
+                        "env_info": _env_info(),
+                    }
+                    dump = _maybe_dump_debug(
+                        {"ref_code": ref_code, "test_code": test_code, "device_idx": device_idx,
+                         "warmup": warmup, "repeat": repeat, "tol": tol, "seed": seed,
+                         "num_inputs": num_inputs},
+                        res, stage="correctness_uncomparable", debug_dir=debug_dir, td=td)
+                    if dump:
+                        res["dump_path"] = dump
+                    return res
 
                 max_err_mean = float(sum(x["max_abs_err"] for x in input_errs) / max(len(input_errs), 1))
                 mean_err_mean = float(sum(x["mean_abs_err"] for x in input_errs) / max(len(input_errs), 1))
