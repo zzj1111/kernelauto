@@ -1,10 +1,18 @@
 import subprocess
 import json
 import re, os, sys, time
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+# Same cap, same variable, same reason as reward_bench_rubric.py: each runner creates its own
+# CUDA context, and on 2026-08-04 243 concurrent ones wedged the GPU driver for every user of
+# the node. compute_score() here never calls bench(), so this guards the offline/debug path the
+# file deliberately keeps — the copy that was made before the cap existed and never got it.
+_MAX_CONCURRENT = int(os.environ.get("CUDAFORGE_MAX_CONCURRENT_RUNNERS", "12"))
+_RUNNER_SLOTS = threading.Semaphore(_MAX_CONCURRENT)
 
 try:
     import requests
@@ -894,6 +902,7 @@ def bench(
     out = ""
     err = ""
     try:
+      with _RUNNER_SLOTS:                      # bounded GPU-context creation; see _MAX_CONCURRENT
         p = subprocess.run(
             cmd,
             input=(json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"),
