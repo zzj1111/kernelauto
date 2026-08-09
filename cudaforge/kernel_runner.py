@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -603,7 +604,19 @@ def compare_and_bench_inline(
 
                 ref_avg = float(sum(ref_times) / max(len(ref_times), 1))
                 tst_avg = float(sum(tst_times) / max(len(tst_times), 1))
-                speedup = ref_avg / max(tst_avg, 1e-9)
+                # max(tst_avg, 1e-9) guards a zero denominator but NOT a NaN one: max(nan, x)
+                # returns nan, so one bad timing yields a NaN speedup, json passes NaN through
+                # verbatim, and the reward composes it into a NaN handed to the optimiser.
+                # A non-finite timing means the MEASUREMENT failed, not that the kernel is wrong
+                # — correctness was decided above — so report no speed credit and say why.
+                if not (math.isfinite(ref_avg) and math.isfinite(tst_avg)):
+                    speedup = 0.0
+                    timings["speedup_note"] = f"non-finite timing: ref={ref_avg} tst={tst_avg}"
+                else:
+                    speedup = ref_avg / max(tst_avg, 1e-9)
+                    if not math.isfinite(speedup):
+                        speedup = 0.0
+                        timings["speedup_note"] = f"non-finite ratio from {ref_avg}/{tst_avg}"
 
         except Exception:
             res = _fail(

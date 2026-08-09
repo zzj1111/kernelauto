@@ -1,5 +1,6 @@
 import subprocess
 import json
+import math
 import re, os, sys, time
 import threading
 
@@ -1131,6 +1132,16 @@ def bench(
         return 0, 0.0
 
     speedup = float(res.get("speedup", 0.0))
+    # The runner speaks JSON, and json.loads accepts NaN and Infinity verbatim — so a bad timing
+    # crosses the process boundary intact, and min(nan, 3.0) is nan, meaning the cap downstream
+    # does not stop it either. A NaN reward is not a small error: GRPO normalises each group by
+    # its mean and std, so ONE of these turns a whole group's advantages into NaN. Correctness
+    # was already decided above, so a broken MEASUREMENT costs the speed credit, not the verdict.
+    if not math.isfinite(speedup):
+        _log({"kind": "non_finite_speedup", "raw": repr(res.get("speedup")),
+              "note": "timing failed; scored correct with no speed credit"})
+        print(f"[CudaForge bench] non-finite speedup {res.get('speedup')!r} -> 0.0")
+        return 1, 0.0
     return 1, speedup
 
 
@@ -1191,6 +1202,13 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         speedup_clip_max=5.0,
     )
 
-    final = min(float(shaped_reward), 3.0)
+    # Last line of defence before the number reaches the optimiser. min() does NOT clamp a NaN
+    # (min(nan, 3.0) is nan), and every upstream guard is one refactor away from being bypassed,
+    # so the invariant "the reward is a finite number in [0, 3]" is asserted where it is owed.
+    final = float(shaped_reward)
+    if not math.isfinite(final):
+        print(f"[rubric] NON-FINITE shaped_reward {shaped_reward!r} -> 0.0  dbg={dbg}")
+        final = 0.0
+    final = max(0.0, min(final, 3.0))
     print(f"[rubric] obj={rubric_obj} dbg={dbg} final={final}")
     return final
