@@ -31,7 +31,12 @@ import os
 # observation module derives its description of the loss from ARM_BARE_LOSS, so it must be
 # False here or the Teacher is told a mechanism that does not exist — and every judgement it
 # makes about what text can buy follows from that mechanism. Set before importing observation.
-os.environ.setdefault("ARM_BARE_LOSS", "False")
+#
+# Assigned, not setdefault: there is no legitimate other value for this arm, so an inherited
+# ARM_BARE_LOSS=True — exported by a launch script, or left in a shell by a previous
+# experiment — must not win. setdefault would silently keep it and the Teacher would reason
+# correctly about a mechanism this repo does not have.
+os.environ["ARM_BARE_LOSS"] = "False"
 
 from . import adapters as A
 from . import scaffold as S
