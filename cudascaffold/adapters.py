@@ -978,9 +978,6 @@ def signals_adapter(checkpoint, scaffold, cfg, seed):
 # Separator folding the A/B arm into the category label so all three arms can share one pass.
 # Chosen because no category or task_name contains it.
 _ARM_SEP = "@@"
-# Row index in the shared base file: the same problem in all three arms, and the only pairing
-# key the CudaForge held-out set has (its 50 rows carry no task_name).
-_PAIR_PREFIX = "row"
 
 
 def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
@@ -1065,24 +1062,17 @@ def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
         SP.build(base, pq, scaf, seed=seed, mode=mode)
         df = pd.read_parquet(pq)
         rows = []
-        for i, x in enumerate(df.extra_info):
+        for x in df.extra_info:
             e = dict(x) if isinstance(x, dict) else json.loads(x)
             cat = e.get("category")
             if not cat:
                 lv = e.get("level")
                 cat = "scratch" if lv is None else f"improve_l{int(float(lv))}"
             e["category"] = f"{cat}{_ARM_SEP}{arm}"
-            # task_name is what per_instance_from_log aggregates on; keep the arms apart there
-            # too so a task appearing three times is not read as one instance tried three times.
-            #
-            # The arms are built from ONE base file, so row i is the same problem in all three:
-            # that index is the pairing key the gate needs, and it is the only one available on
-            # the CudaForge held-out set, whose 50 rows carry no task_name at all and were
-            # therefore dropped entirely by per_instance_from_log. Prefixed to the real name
-            # where there is one, so the instance stays human-readable.
-            base_name = e.get("task_name") or ""
-            e["task_name"] = f"{_PAIR_PREFIX}{i}" + (f"@{base_name}" if base_name else "") \
-                             + f"{_ARM_SEP}{arm}"
+            # task_name is what per_instance_from_log aggregates on; keep the arms apart there too
+            # so a task appearing three times is not read as one instance tried three times.
+            if e.get("task_name"):
+                e["task_name"] = f"{e['task_name']}{_ARM_SEP}{arm}"
             rows.append(e)
         df["extra_info"] = rows
         frames.append(df)
@@ -1107,7 +1097,6 @@ def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
     off = worker_log_offsets(cfg)
     _measure_pass(checkpoint, merged, "ab", cfg, seed)
     by_cat = per_category_from_log(off)
-    by_inst, _ = per_instance_from_log(offsets=off, limit=0)
 
     out = {"bare": {}, "current": {}, "candidate": {}}
     for key, v in by_cat.items():
@@ -1120,29 +1109,6 @@ def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
             # absent contributes nothing, present at 0.0 counts as a measured failure.
             if not tasks or cat in tasks:
                 out[arm][cat] = (v["correct_rate"], v["n"])
-
-    # Per-PROBLEM outcomes, which is what the gate's statistics actually need. A row is not an
-    # independent sample: the budget buys `reps` copies of each problem, and copies of one
-    # problem mostly meet the same fate, so counting rows as independent understates the noise
-    # by up to sqrt(1+(reps-1)*rho). Handing the gate the problem-level table lets it use the
-    # problem as the unit and pair the arms on it.
-    per_problem = {"bare": {}, "current": {}, "candidate": {}}
-    pair_cat = {}
-    for key, v in by_inst.items():
-        if _ARM_SEP not in key:
-            continue
-        inst, arm = key.rsplit(_ARM_SEP, 1)
-        if arm not in per_problem:
-            continue
-        cat = cat_of_level(v.get("level"))
-        if tasks and cat and cat not in tasks:
-            continue
-        per_problem[arm][inst] = (round(v["correct_rate"] * v["n"]), v["n"])
-        if cat:
-            pair_cat[inst] = cat
-    out["per_problem"] = per_problem
-    out["pair_category"] = pair_cat
-    out["reps"] = reps
     return out
 
 
