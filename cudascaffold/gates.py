@@ -47,6 +47,37 @@ def _weighted_mean(per_task, tasks):
     return (num / den if den else 0.0), den
 
 
+def _paired_stats(measure, tasks):
+    """(mean paired difference, its standard error, #problems) — or None if unavailable.
+
+    The unit of independence is the PROBLEM, not the row: the A/B buys `reps` copies of each
+    problem and copies mostly meet the same fate. So each problem is collapsed to its own
+    success rate first, the arms are differenced problem by problem, and the SE is the spread
+    of those differences — which is both cluster-correct and paired.
+
+    Returns None when the measurement predates this field or when fewer than two problems are
+    shared by the two arms, so the caller falls back to the row-level rule rather than deciding
+    on a statistic it cannot compute.
+    """
+    per = measure.get("per_problem") or {}
+    cur, cand = per.get("current") or {}, per.get("candidate") or {}
+    cats = measure.get("pair_category") or {}
+    shared = [k for k in cur if k in cand and (not tasks or cats.get(k, None) in tasks
+                                               or k not in cats)]
+    diffs = []
+    for k in shared:
+        c_ok, c_n = cur[k]
+        k_ok, k_n = cand[k]
+        if c_n and k_n:
+            diffs.append(k_ok / k_n - c_ok / c_n)
+    n = len(diffs)
+    if n < 2:
+        return None
+    mean = sum(diffs) / n
+    var = sum((d - mean) ** 2 for d in diffs) / (n - 1)
+    return mean, (var / n) ** 0.5, n
+
+
 def ab_gate(measure, tasks):
     """Decide whether to ACCEPT a proposed text change.
 
@@ -112,6 +143,32 @@ def ab_gate(measure, tasks):
     if not cur_n or not cand_n:
         return {"accept": False, "reason": "missing A/B samples -> reject (keep current)",
                 "cand_mean": cand_mean, "cur_mean": cur_mean, "bare_mean": bare_mean, "n": 0}
+
+    # Prefer the problem-level table when the measurement supplies it. A row is NOT an
+    # independent sample — the budget buys `reps` copies of each problem — so the row-count SE
+    # below understates the noise by up to sqrt(1+(reps-1)*rho). The step-40 same-condition pass
+    # shows this directly: its 0.074 gap is 3.3 row-level SEs, which is near-impossible for
+    # independent draws, but 1.6 SEs once copies of a problem are treated as one cluster.
+    # Pairing on the problem costs nothing extra (all three arms already run the same problems)
+    # and removes problem difficulty, the largest term, from the comparison.
+    paired = _paired_stats(measure, tasks)
+    if paired:
+        diff, se, n_problems = paired
+        margin = NOISE_K * se
+        accept = diff > margin
+        reason = (f"paired candidate-current {diff:+.3f} +- {se:.3f} over {n_problems} problems "
+                  f"(candidate {cand_mean:.3f} vs current {cur_mean:.3f}, bare {bare_mean:.3f}, "
+                  f"margin {margin:.3f}) -> {'ACCEPT' if accept else 'reject'}")
+        below_bare = bool(accept and cand_mean < bare_mean)
+        if below_bare:
+            reason += ("  [WARNING: accepted text scores BELOW the no-text arm — it beats the "
+                       "current scaffold but loses to having no scaffold at all]")
+        return {"accept": accept, "reason": reason, "cand_mean": round(cand_mean, 3),
+                "cur_mean": round(cur_mean, 3), "bare_mean": round(bare_mean, 3),
+                "below_bare": below_bare, "margin": round(margin, 4), "n": n_problems,
+                "paired_diff": round(diff, 4), "paired_se": round(se, 4),
+                "unit": "problem"}
+
     margin = NOISE_K * ((cur_mean * (1 - cur_mean) / cur_n)
                         + (cand_mean * (1 - cand_mean) / cand_n)) ** 0.5
     accept = cand_mean > cur_mean + margin

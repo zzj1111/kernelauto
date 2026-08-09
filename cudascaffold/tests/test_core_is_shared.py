@@ -26,6 +26,18 @@ import pytest
 
 CORE = ("scaffold.py", "splice.py", "observation.py", "teacher.py", "gates.py", "loop.py")
 
+# A divergence is allowed only when it is DECLARED here with the reason. Silent drift is what
+# this test was written to catch; a justified difference is a different thing, and forcing it to
+# be written down keeps the two indistinguishable cases apart.
+DIVERGED = {
+    "gates.py":
+        "The A/B designs are no longer the same measurement. This arm buys `reps` copies of "
+        "each held-out problem in one pass, so a row is not an independent sample and the "
+        "unit of analysis has to be the problem (cluster-correct, paired across arms). The "
+        "ALFWorld arm rolls out each group once and has no repeats to cluster over, so the "
+        "row-level rule is correct there. Retire this entry when that arm's gate is ported.",
+}
+
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OTHER = os.environ.get("AUTOSCAFFOLD_PEER",
                        "/mnt/data1/zha00175/verl-agent/agent_system/skill_opt/autoscaffold")
@@ -42,6 +54,12 @@ def test_core_file_matches_the_other_arm(name):
     if not os.path.exists(peer):
         pytest.skip(f"peer arm not present at {OTHER}")
     mine = os.path.join(HERE, name)
+    if name in DIVERGED:
+        assert _sha(mine) != _sha(peer), (
+            f"{name} is declared DIVERGED but is byte-identical to the peer again. Either the "
+            f"divergence was reverted — then delete its DIVERGED entry — or the peer adopted "
+            f"this arm's version, in which case delete it too and let the files be pinned.")
+        pytest.skip(f"{name} diverges by declaration: {DIVERGED[name]}")
     assert _sha(mine) == _sha(peer), (
         f"{name} differs between the two arms.\n"
         f"  here: {mine}\n  peer: {peer}\n"
