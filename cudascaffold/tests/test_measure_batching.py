@@ -76,3 +76,42 @@ def test_every_problem_is_still_scored_once_per_arm():
     seen = pd.concat([merged.iloc[i:i + size] for i in range(0, len(merged), size)])
     assert len(seen) == 3 * n
     assert (seen.groupby("arm")["row"].nunique() == n).all()
+
+
+def test_hydra_overrides_match_what_the_config_already_defines():
+    """A '+' prefix means "add a key that is not there". Using it on a key that IS there is a
+    hard startup failure — `Could not append to config. An item is already at ...` — and it cost
+    a full model load to discover, because nothing before the trainer's own config composition
+    can see it.
+
+    The sibling ALFWorld arm legitimately needs '+' for the same setting, since its verl does
+    not define the key. So the syntax is not a matter of taste; it has to match the config in
+    THIS tree.
+    """
+    import re as _re
+    import yaml
+    from cudascaffold import adapters as A
+
+    cfg_path = os.path.join(REPO, "verl", "trainer", "config", "_generated_ppo_trainer.yaml")
+    with open(cfg_path) as f:
+        defined = yaml.safe_load(f)
+
+    def exists(dotted):
+        node = defined
+        for part in dotted.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return False
+            node = node[part]
+        return True
+
+    src = open(A.__file__, encoding="utf-8").read()
+    body = src[src.index("def _train_cmd("):src.index("def _measure_pass(")]
+    for m in _re.finditer(r'f?"\+([a-z_]+(?:\.[a-z_0-9]+)+)=', body):
+        assert not exists(m.group(1)), (
+            f"'+{m.group(1)}' appends a key the config already defines; hydra refuses and the "
+            f"trainer dies at startup")
+    for m in _re.finditer(r'f?"([a-z_]+(?:\.[a-z_0-9]+)+)=', body):
+        key = m.group(1)
+        if key.startswith(("data.", "trainer.", "algorithm.")) and not exists(key):
+            raise AssertionError(
+                f"'{key}' overrides a key this config does not define; it needs a '+' prefix")

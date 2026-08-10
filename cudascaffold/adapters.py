@@ -161,7 +161,12 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=999999):
         # signal mid-run. The dataset is one file of short prompts, so the workers buy nothing.
         # The sibling ALFWorld arm carries the same line for the same reason, after an OOM kill
         # during a checkpoint save took a whole node with it.
-        f"+data.dataloader_num_workers={cfg.get('dataloader_workers', 0)}",
+        # No leading '+': this key already exists in this repo's config (see
+        # verl/trainer/config/_generated_ppo_trainer.yaml), and hydra rejects appending to an
+        # item that is already there. The ALFWorld arm needs the '+' because its verl does not
+        # define it — same setting, different override syntax, and the difference is a hard
+        # failure at startup rather than a silent one.
+        f"data.dataloader_num_workers={cfg.get('dataloader_workers', 0)}",
         f"data.max_prompt_length={cfg['max_prompt_length']}",
         f"data.max_response_length={cfg['max_response_length']}",
         f"actor_rollout_ref.model.path={cfg['model']}",
