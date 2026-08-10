@@ -42,6 +42,11 @@ VENV_BIN = os.path.dirname(VENV_PY)
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
+# Rows per validation wave in a measurement pass. Sized so the reward's in-flight work stays
+# well under what wedged the driver (85 concurrent) and near what training sustains safely
+# (48 candidates per step, spread over eight scorer processes). Overridable per site.
+_MEASURE_BATCH_ROWS = int(os.environ.get("ARM_MEASURE_BATCH_ROWS", "36"))
+
 # Key under which worker_log_offsets stores the ray_tmp root, so _read_since can re-glob the tree
 # at read time instead of trusting the directories that happened to exist at snapshot time.
 _ROOT_KEY = "__ray_tmp_root__"
@@ -815,6 +820,21 @@ def _measure_pass(checkpoint, parquet, tag, cfg, seed):
     env["VLLM_SEED"] = str(seed)
     cmd = _train_cmd(cfg, parquet, step, val_before=True, test_freq=1) + " trainer.val_only=True"
     cmd = cmd.replace(f"data.val_files={cfg['val_file']}", f"data.val_files={parquet}")
+    # Feed the pass in waves. verl defaults data.val_batch_size to null, which means "the whole
+    # file in one batch" (ray_trainer.py:398-400) — so the A/B handed 540 rows to the reward at
+    # once, and every completed generation forked a kernel_runner that creates a CUDA context.
+    # On 2026-08-10 that put 85 of them on one GPU inside 49 seconds and deadlocked the driver's
+    # global rwsem; the node needed a reboot.
+    #
+    # The validation loop iterates its dataloader batch by batch (ray_trainer.py:550), generating
+    # and scoring each before the next, so a bounded batch size bounds the peak directly — while
+    # still loading the model exactly once, which chunking the file into separate passes would
+    # not (each pass is a fresh verl process: an 8B load plus vLLM init).
+    #
+    # This is the structural bound. The node-wide slot cap stays as the backstop, but peak
+    # concurrency should be set by how much work is in flight, not by how high the cap happens
+    # to be set.
+    cmd += f" data.val_batch_size={int(cfg.get('measure_batch_rows', _MEASURE_BATCH_ROWS))}"
     _run(cmd, log, env)
     return parse_val(log)
 
