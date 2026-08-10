@@ -1,4 +1,5 @@
 import subprocess
+import hashlib
 import json
 import math
 import re, os, sys, time
@@ -1007,12 +1008,30 @@ def bench(
     # double-insurance: set TORCH_CUDA_ARCH_LIST in parent env too
     env["TORCH_CUDA_ARCH_LIST"] = str(torch_cuda_arch_list)
 
-    # extensions dir strategy
+    # Extensions dir strategy.
+    #
+    # "shared" used to point every concurrent runner at ONE directory per GPU. torch's build
+    # directory inside it is keyed only on the load_inline `name=`, which the MODEL chooses —
+    # and models reuse obvious names like "fused_op" constantly. Two candidates compiling under
+    # the same name at the same time write their sources over each other in one directory, so a
+    # candidate can be graded on another candidate's .so. The same key also makes a timeout
+    # contagious: subprocess.run kills a hung runner with SIGKILL, which it cannot catch, so
+    # torch's build lock file is left behind and every later candidate using that name waits on
+    # a baton nobody will ever drop.
+    #
+    # Keying the directory on the SOURCE removes both. Identical code still shares a build (the
+    # only cache hit that was ever legitimate — greedy decoding does produce duplicates), while
+    # different code can no longer collide, and an abandoned lock is scoped to the one source
+    # that produced it instead of to every future candidate with the same extension name.
+    vis = env.get("CUDA_VISIBLE_DEVICES", "unknown")
     if ext_dir_mode == "shared":
-        vis = env.get("CUDA_VISIBLE_DEVICES", "unknown")
-        env["TORCH_EXTENSIONS_DIR"] = f"/tmp/torch_ext_cache_reward_cuda{vis}"
+        root = os.environ.get("CUDAFORGE_EXT_CACHE_ROOT",
+                              f"/tmp/torch_ext_cache_reward_cuda{vis}")
+        digest = hashlib.sha1((solution_str or "").encode("utf-8", "replace")).hexdigest()[:16]
+        ext_dir = os.path.join(root, digest)
     else:
-        env["TORCH_EXTENSIONS_DIR"] = f"/dev/shm/torch_ext_{pid}_{ts}"
+        ext_dir = f"/dev/shm/torch_ext_{pid}_{ts}"
+    env["TORCH_EXTENSIONS_DIR"] = ext_dir
 
     # 4) runner debug dir
     runner_debug_dir = os.path.join(log_dir, "runner_debug", f"{ts}_pid{pid}")
@@ -1095,6 +1114,17 @@ def bench(
             })
 
     except subprocess.TimeoutExpired as e:
+        # subprocess.run kills a hung runner with SIGKILL, which it cannot catch, so anything it
+        # was holding is simply abandoned — including torch's build lock file. Nothing else
+        # cleans that up, and the next candidate with the same SOURCE would wait on a baton
+        # nobody will ever drop. Hashing the directory already stops this spreading to other
+        # candidates; removing it here stops the identical-source retry from inheriting it too.
+        try:
+            import shutil
+            if ext_dir and ext_dir.startswith(("/tmp/", "/dev/shm/")) and os.path.isdir(ext_dir):
+                shutil.rmtree(ext_dir, ignore_errors=True)
+        except Exception:
+            pass
         partial_out = _decode_maybe_bytes(getattr(e, "stdout", None), max_io_chars)
         partial_err = _decode_maybe_bytes(getattr(e, "stderr", None), max_io_chars)
 
@@ -1181,6 +1211,26 @@ def bench(
 # Final Reward (bench + rubric shaping)
 # ============================================================
 
+def _emit_attribution(data_source, extra_info, correctness, speedup, reward):
+    """The controller's ONLY channel for per-instance and per-category signals.
+
+    cudascaffold does not read this function's return value — it scrapes this line out of the
+    Ray worker logs (see cudascaffold/adapters.py REWARD_LINE). So every scored candidate must
+    emit exactly one, on every path, or it simply does not exist as far as the Teacher is
+    concerned.
+
+    `category` is echoed alongside `level` because the two datasets define categories
+    differently: the CUDA set by level, the Triton set by operator family with level==0
+    throughout. `reward` is the number that actually reached the optimiser, which is not
+    implied by correctness — a correct, fast kernel zeroed by the rubric's major_hacking flag
+    reports correctness 1 with reward 0.
+    """
+    ei = extra_info or {}
+    print(f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
+          f"task_name:{ei.get('task_name')}, level:{ei.get('level')}, "
+          f"category:{ei.get('category')}, reward:{reward}")
+
+
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """
     Final reward:
@@ -1190,24 +1240,17 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
       - else shaped bench reward
     """
     if extra_info is None or "answer" not in extra_info:
+        # Attributed like every other outcome. Returning silently here made these candidates
+        # invisible to the Teacher: the controller learns what happened only from this line.
+        _emit_attribution(data_source, extra_info, 0, 0.0, 0.0)
         return 0.0
 
     reference_code = extra_info["answer"]
 
     correctness, speedup = bench(solution_str, reference_code)
-    # task_name/level are echoed so an outer harness can attribute a reward to the INSTANCE that
-    # produced it. verl's own validation only reports per-data_source means, which cannot say
-    # which kernel task is failing — and "which instance is stuck" is the whole basis for
-    # per-instance scaffolding. Print only; nothing about the score changes.
-    _ei = extra_info or {}
-    # `category` is echoed alongside `level` because a dataset can carry either: the CUDA set
-    # defines its categories by level, the Triton set by operator family with level==0 throughout.
-    # The harness aggregates per category, so whichever one is authoritative has to reach the log.
-    print(f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
-          f"task_name:{_ei.get('task_name')}, level:{_ei.get('level')}, "
-          f"category:{_ei.get('category')}")
 
     if correctness != 1:
+        _emit_attribution(data_source, extra_info, correctness, speedup, 0.0)
         return 0.0
 
     # extract candidate code for judge
@@ -1243,4 +1286,9 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         final = 0.0
     final = max(0.0, min(final, 3.0))
     print(f"[rubric] obj={rubric_obj} dbg={dbg} final={final}")
+    # Emitted AFTER the rubric gate, so the line reports what the candidate actually earned.
+    # Printing it before the gate meant a kernel zeroed for major_hacking was reported to the
+    # Teacher as a success with a positive speedup — correct and fast on the record, worth
+    # nothing in the gradient — and the Teacher would credit the text that produced it.
+    _emit_attribution(data_source, extra_info, correctness, speedup, final)
     return final

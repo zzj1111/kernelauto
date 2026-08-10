@@ -78,7 +78,7 @@ def test_the_printed_fields_carry_the_instance_and_its_category(reward, stub, ca
                                      "category": "matmul"})
     m = REWARD_LINE.search(capsys.readouterr().out)
     assert m, "no parseable reward line"
-    correct, speedup, ds, task, level, category = m.groups()
+    correct, speedup, ds, task, level, category, reward = m.groups()
     assert task == "matmul_tiled"
     assert cat_of_level(level, category) == "matmul", (
         f"the controller would file this candidate under {cat_of_level(level, category)!r}")
@@ -92,7 +92,7 @@ def test_a_candidate_without_a_task_name_still_reports_its_category(reward, stub
     _score(reward, stub=stub, extra={"level": 2})
     m = REWARD_LINE.search(capsys.readouterr().out)
     assert m, "no parseable reward line for a task_name-less candidate"
-    _c, _s, _ds, _task, level, category = m.groups()
+    _c, _s, _ds, _task, level, category, _reward = m.groups()
     assert cat_of_level(level, category) == "improve_l2"
 
 

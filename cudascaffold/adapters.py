@@ -401,7 +401,11 @@ def _eval_merged(checkpoint, step, val_n, cfg):
 # `category:` is optional so logs written before it was echoed still parse.
 REWARD_LINE = re.compile(
     r"correctness:\s*(\d+),\s*speedup:\s*([0-9.eE+-]+),\s*data_source:(\S+?),\s*"
-    r"task_name:(\S+?),\s*level:([^,\s]+)(?:,\s*category:(\S+))?")
+    r"task_name:(\S+?),\s*level:([^,\s]+)(?:,\s*category:([^,\s]+))?"
+    # `reward` is what actually reached the optimiser, and it is NOT implied by correctness: a
+    # correct, fast kernel zeroed by the rubric's major_hacking flag reports correctness 1 with
+    # reward 0. Optional so logs written before the field existed still parse.
+    r"(?:,\s*reward:([0-9.eE+-]+))?")
 
 
 def worker_log_offsets(cfg):
@@ -481,7 +485,7 @@ def per_instance_from_log(logpath=None, limit=40, offsets=None, cfg=None):
             return {}, []
     agg = {}
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, task, level, _category = m.groups()
+        correct, speedup, _ds, task, level, _category, _reward = m.groups()
         if task in ("None", ""):
             continue
         a = agg.setdefault(task, {"n": 0, "n_correct": 0, "speedups": [], "level": level})
@@ -558,7 +562,7 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
     per_task = collections.defaultdict(list)
     cat_of = {}
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, task, level, category = m.groups()
+        correct, speedup, _ds, task, level, category, _reward = m.groups()
         if task in ("None", ""):
             continue
         cat = cat_of_level(level, category)
@@ -702,7 +706,7 @@ def zero_gradient_groups_from_log(offsets, rollout_n=None):
     per_task = collections.defaultdict(list)
     cat_of = {}
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, task, level, category = m.groups()
+        correct, speedup, _ds, task, level, category, _reward = m.groups()
         if task in ("None", ""):
             continue
         cat = cat_of_level(level, category)
@@ -769,7 +773,7 @@ def per_category_from_log(offsets):
     txt = _read_since(offsets)
     agg = {}
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, _task, level, category = m.groups()
+        correct, speedup, _ds, _task, level, category, _reward = m.groups()
         cat = cat_of_level(level, category)
         if cat is None:
             continue
