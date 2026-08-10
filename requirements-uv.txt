@@ -13,7 +13,7 @@
 # before torch is in place; flash-attn's wheel is ABI-pinned to torch==2.8.0 cp312.
 
 # --- core verl / training loop ---
-accelerate==1.12.0
+accelerate==1.14.0
 codetiming==1.4.0
 datasets==4.4.1
 dill==0.4.0
