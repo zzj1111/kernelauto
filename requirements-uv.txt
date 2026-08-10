@@ -10,7 +10,7 @@
 # UV_INSTALL.md "Deliberately excluded" section).
 #
 # Install order matters — see UV_INSTALL.md. Do not `uv pip install -r` this file blindly
-# before torch is in place; flash-attn's wheel is ABI-pinned to torch==2.8.0 cp312.
+# before torch is in place; flash-attn's wheel is ABI-pinned to torch==2.13.0 cp312.
 
 # --- core verl / training loop ---
 accelerate==1.12.0
@@ -33,7 +33,7 @@ packaging==25.0
 tensorboard==2.20.0
 
 # --- GPU stack (Hopper / sm_90 build; adjust TORCH_CUDA_ARCH_LIST for other GPUs) ---
-torch==2.8.0
+torch==2.13.0
 torchvision==0.23.0
 torchaudio==2.8.0
 ninja==1.13.0
