@@ -7,12 +7,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-# Same cap, same variable, same reason as reward_bench_rubric.py: each runner creates its own
-# CUDA context, and on 2026-08-04 243 concurrent ones wedged the GPU driver for every user of
-# the node. compute_score() here never calls bench(), so this guards the offline/debug path the
-# file deliberately keeps — the copy that was made before the cap existed and never got it.
-_MAX_CONCURRENT = int(os.environ.get("CUDAFORGE_MAX_CONCURRENT_RUNNERS", "12"))
-_RUNNER_SLOTS = threading.Semaphore(_MAX_CONCURRENT)
+# The node-wide slot pool lives in reward_bench_rubric so the two rewards cannot cap
+# differently — a divergent copy is how the ablation missed the cap in the first place.
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location(
+    "_cudaforge_slots", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "reward_bench_rubric.py"))
+_slots_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_slots_mod)
+_MAX_CONCURRENT = _slots_mod._MAX_CONCURRENT
+_SLOT_TIMEOUT_S = _slots_mod._SLOT_TIMEOUT_S
+_RUNNER_SLOTS = _slots_mod._RUNNER_SLOTS
 
 try:
     import requests
@@ -902,7 +907,9 @@ def bench(
     out = ""
     err = ""
     try:
-      with _RUNNER_SLOTS:                      # bounded GPU-context creation; see _MAX_CONCURRENT
+      # Node-wide slot, not a per-process counter: verl runs this module in
+      # reward_model.num_workers separate actors. See _NodeSlots.
+      with _RUNNER_SLOTS.acquire(timeout=_SLOT_TIMEOUT_S):
         p = subprocess.run(
             cmd,
             input=(json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"),

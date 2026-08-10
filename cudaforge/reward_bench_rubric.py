@@ -1,29 +1,83 @@
 import subprocess
+import contextlib
 import hashlib
 import json
 import math
 import re, os, sys, time
-import threading
 
 # ---------------------------------------------------------------------------------------------
-# HARD CAP on how many kernel_runner.py subprocesses may exist at once.
+# HARD CAP on how many kernel_runner.py subprocesses may exist at once, ACROSS THE WHOLE NODE.
 #
-# verl's RewardLoopWorker creates one asyncio task PER ROW with no limit
-# (verl/experimental/reward/reward_manager.py:81), so a 900-row batch asks for 900 concurrent
-# scores, and each score forks a fresh Python that initialises a CUDA context on the reward GPU,
-# compiles, benchmarks, and exits.
+# Each score forks a fresh Python that creates a CUDA context on the reward GPU, compiles,
+# benchmarks and exits. Context creation is the scarce resource; compilation and benchmarking
+# may overlap freely.
 #
-# On 2026-08-04 that produced 243 kernel_runner processes inside 82 seconds on one GPU. They
-# wedged the driver: 105 stuck in uvm_gpu_release, 37 in uvm_gpu_retain_by_uuid, 94 queued on the
-# rwsem between them — one batch creating contexts while another destroyed them, deadlocked
-# inside the kernel module. D-state processes do not take SIGKILL (verified: SIGKILL sat pending
-# for hours), no new process could so much as import torch, and the node needed a reboot.
+# This was a threading.Semaphore, which is per PROCESS — and the reward does not run in one
+# process. verl builds `reward_model.num_workers` RewardLoopWorker actors (default 8, see
+# verl/trainer/config/_generated_ppo_trainer.yaml), each of which loads this module by path and
+# therefore got its own counter, so a nominal cap of 12 was really 8 x 12 = 96. Measured on
+# 2026-08-10: the A/B pass (540 rows chunked across 8 workers, one asyncio task per row) put 85
+# runners on one GPU inside 49 seconds and wedged the driver — 113 processes in uninterruptible
+# sleep on os_acquire_rwlock_read, load 124, nvidia-smi itself hanging. The same shape as
+# 2026-08-04 (243 processes in 82 seconds), which is when the per-process semaphore was added.
+# Training survived the same code because a step is only 48 candidates, six per worker.
 #
-# The cap is on CONTEXT CREATION, which is the scarce thing here — not on CPU or on throughput.
-# Compilation and benchmarking still overlap; what cannot overlap is 900 processes racing to
-# attach to the same GPU.
+# So the cap is now a set of lock FILES, and the kernel owns it:
+#   * one lock file per slot, shared by every process on the node
+#   * flock is released when the holder's file descriptor closes — including on death, so a
+#     crashed scorer cannot leak a slot
+#   * and a process stuck in D state has NOT died, so it keeps its slot. That is the correct
+#     accounting: its CUDA context is still real. A counter in userspace would have handed the
+#     slot to a new process while the old one still held the driver.
 _MAX_CONCURRENT = int(os.environ.get("CUDAFORGE_MAX_CONCURRENT_RUNNERS", "12"))
-_RUNNER_SLOTS = threading.Semaphore(_MAX_CONCURRENT)
+_SLOT_DIR = os.environ.get(
+    "CUDAFORGE_SLOT_DIR",
+    f"/tmp/cudaforge_slots_gpu{os.environ.get('REWARD_CUDA_VISIBLE_DEVICES', 'na')}")
+_SLOT_WAIT_S = float(os.environ.get("CUDAFORGE_SLOT_POLL_SEC", "0.5"))
+# Long enough that a healthy queue always drains, short enough that a wedged node
+# does not hang the whole batch behind slots nobody will release.
+_SLOT_TIMEOUT_S = float(os.environ.get("CUDAFORGE_SLOT_TIMEOUT_SEC", "1800"))
+
+
+class _NodeSlots:
+    """A counting semaphore shared by every process on this node, backed by flock."""
+
+    def __init__(self, n, directory):
+        self.n, self.dir = max(1, int(n)), directory
+
+    @contextlib.contextmanager
+    def acquire(self, timeout=None):
+        import fcntl
+        os.makedirs(self.dir, exist_ok=True)
+        deadline = None if timeout is None else time.time() + timeout
+        fd = None
+        try:
+            while fd is None:
+                for i in range(self.n):
+                    f = open(os.path.join(self.dir, f"slot_{i:03d}"), "a+")
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fd = f
+                        break
+                    except OSError:
+                        f.close()
+                if fd is None:
+                    if deadline is not None and time.time() > deadline:
+                        # Never block a batch forever on a wedged node: proceed uncapped rather
+                        # than deadlock, and say so, because this is the signal that slots are
+                        # held by processes that will not exit.
+                        print(f"[CudaForge] waited {timeout}s for one of {self.n} runner slots in "
+                              f"{self.dir}; proceeding UNCAPPED — check for stuck processes")
+                        yield None
+                        return
+                    time.sleep(_SLOT_WAIT_S)
+            yield fd
+        finally:
+            if fd is not None:
+                fd.close()          # releases the flock
+
+
+_RUNNER_SLOTS = _NodeSlots(_MAX_CONCURRENT, _SLOT_DIR)
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -1100,7 +1154,9 @@ def bench(
     out = ""
     err = ""
     try:
-      with _RUNNER_SLOTS:                      # bounded GPU-context creation; see _MAX_CONCURRENT
+      # Node-wide slot, not a per-process counter: verl runs this module in
+      # reward_model.num_workers separate actors. See _NodeSlots.
+      with _RUNNER_SLOTS.acquire(timeout=_SLOT_TIMEOUT_S):
         p = subprocess.run(
             cmd,
             input=(json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"),

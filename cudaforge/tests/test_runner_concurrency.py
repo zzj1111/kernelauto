@@ -38,23 +38,39 @@ def test_the_runner_subprocess_is_inside_the_semaphore(name):
             f"243 unbounded runners took the GPU driver down for the whole node once.")
 
 
-@pytest.mark.parametrize("name", REWARDS)
-def test_the_cap_is_declared_and_configurable(name):
-    src = _src(name)
-    if "subprocess.run(" not in src:
-        pytest.skip(f"{name} spawns nothing")
-    assert "CUDAFORGE_MAX_CONCURRENT_RUNNERS" in src, (
-        f"{name} must read the cap from the same env var as its sibling, so raising it on one "
-        f"path cannot silently leave the other unbounded")
+def test_both_rewards_share_one_slot_pool():
+    """Stronger than "both mention the same env var", which is what this asserted before.
+
+    A divergent copy is how the ablation missed the cap in the first place, so the ablation now
+    imports the pool from its sibling instead of declaring one. Identity of the object is the
+    property that matters: two pools would queue on different slot directories and neither would
+    cap the other.
+    """
+    import importlib.util
+    mods = {}
+    for name in REWARDS:
+        spec = importlib.util.spec_from_file_location(name[:-3], os.path.join(HERE, name))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        mods[name] = m
+    a, b = (mods[n] for n in REWARDS)
+    assert a._MAX_CONCURRENT == b._MAX_CONCURRENT, "the two rewards cap differently"
+    assert a._RUNNER_SLOTS.dir == b._RUNNER_SLOTS.dir, \
+        "different slot directories: neither pool constrains the other"
 
 
-def test_the_two_rewards_agree_on_the_cap():
-    """A divergent default is how the first copy went stale — same knob, same number."""
-    pat = re.compile(r'CUDAFORGE_MAX_CONCURRENT_RUNNERS"\s*,\s*"(\d+)"')
-    caps = {name: pat.search(_src(name)) for name in REWARDS}
-    found = {name: m.group(1) for name, m in caps.items() if m}
-    assert len(found) == len(REWARDS), f"cap not found in: {set(REWARDS) - set(found)}"
-    assert len(set(found.values())) == 1, f"the two rewards cap differently: {found}"
+def test_the_cap_is_configurable_from_one_place():
+    src = _src("reward_bench_rubric.py")
+    assert "CUDAFORGE_MAX_CONCURRENT_RUNNERS" in src, \
+        "the cap must stay settable without editing code"
+    # Checked on the parsed code, not the text: the comment above the pool explains what a
+    # threading.Semaphore did wrong, and must not itself trip this.
+    import ast
+    names = {f"{getattr(n.value,'id','')}.{n.attr}" for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Attribute)}
+    assert "threading.Semaphore" not in names, (
+        "a threading.Semaphore counts inside ONE process, and verl runs this module in "
+        "reward_model.num_workers separate actors — that is what made a nominal 12 into 96")
 
 
 def test_the_ablation_reward_never_benches():
