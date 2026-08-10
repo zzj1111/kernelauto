@@ -244,12 +244,12 @@ def test_the_trainer_loads_data_in_process():
     from cudascaffold import adapters as A
     cfg = {"train_batch_size": 8, "max_prompt_length": 2048, "max_response_length": 8192,
            "model": "/m", "lora_rank": 128, "lora_alpha": 128, "lr": 1e-6, "kl": 0.03,
-           "val_file": "/v.parquet", "ckpt_root": "/c", "exp": "e", "n_gpus": 2, "tp": 2,
-           "gpu_mem": 0.35, "mini_bs": 4, "micro_bs": 1, "rollout_n": 6, "project": "p"}
-    try:
-        cmd = A._train_cmd(cfg, "/t.parquet", 10)
-    except KeyError as e:                       # cfg shape drifted; the assertion still applies
-        import pytest
-        pytest.skip(f"_train_cmd needs {e}")
-    assert "+data.dataloader_num_workers=0" in cmd, (
+           "kl_loss_coef": 0.03, "val_file": "/v.parquet", "ckpt_root": "/c", "exp": "e",
+           "n_gpus": 2, "tp": 2, "tp_size": 2, "gpu_mem": 0.35, "mini_bs": 4, "micro_bs": 1,
+           "ppo_mini_batch_size": 4, "rollout_n": 6, "project": "p", "reward_path": "/r.py",
+           "steps_per_cycle": 10, "total_epochs": 20}
+    cmd = A._train_cmd(cfg, "/t.parquet", 10)
+    assert "data.dataloader_num_workers=0" in cmd, (
         "the trainer would fork 8 dataloader workers of an 8B-model process")
+    assert "+data.dataloader_num_workers" not in cmd, (
+        "this key already exists in the config; a leading plus makes hydra refuse to start")

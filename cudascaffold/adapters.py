@@ -167,6 +167,21 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=999999):
         # define it — same setting, different override syntax, and the difference is a hard
         # failure at startup rather than a silent one.
         f"data.dataloader_num_workers={cfg.get('dataloader_workers', 0)}",
+        # Score each candidate ONCE. This verl has two reward paths and both are wired to our
+        # compute_score: the agent loop calls reward_loop_worker.compute_score per rollout as it
+        # finishes (agent_loop.py:557-578, gated on reward_model.use_reward_loop, which upstream
+        # defaults to true), and the reward manager scores the batch again afterwards. Measured
+        # on the 2026-08-10 A/B: 540 rows produced 1084 bench() invocations — every kernel
+        # compiled, run and timed twice.
+        #
+        # That is not just 2x the cost. Each invocation forks a runner that creates a CUDA
+        # context, and context creation is exactly what deadlocked the driver, so the duplicate
+        # path doubled the load that took the node down. It also doubled the gate's n, which is
+        # harmless only while the acceptance margin is off.
+        #
+        # The manager path is the one kept, because the controller's per-category and
+        # per-instance signals are scraped from the line compute_score prints under it.
+        "reward_model.use_reward_loop=False",
         f"data.max_prompt_length={cfg['max_prompt_length']}",
         f"data.max_response_length={cfg['max_response_length']}",
         f"actor_rollout_ref.model.path={cfg['model']}",

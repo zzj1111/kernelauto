@@ -115,3 +115,42 @@ def test_hydra_overrides_match_what_the_config_already_defines():
         if key.startswith(("data.", "trainer.", "algorithm.")) and not exists(key):
             raise AssertionError(
                 f"'{key}' overrides a key this config does not define; it needs a '+' prefix")
+
+
+def test_only_one_reward_path_is_enabled():
+    """Every candidate must be compiled, run and timed exactly once.
+
+    This verl has two reward paths, both wired to the same compute_score: the agent loop scores
+    each rollout as it finishes (agent_loop.py:557-578, gated on reward_model.use_reward_loop,
+    which the generated config defaults to true), and the reward manager scores the batch again.
+    Measured on the 2026-08-10 A/B: 540 rows produced 1084 bench() invocations.
+
+    The cost is the smaller half of it. Each invocation forks a runner that creates a CUDA
+    context, and context creation is what deadlocked the driver — so the duplicate path doubled
+    exactly the load that took the node down, and doubled the gate's n while it was at it.
+    """
+    from cudascaffold import adapters as A
+    # The full key set _train_cmd needs. Spelled out rather than skipped on KeyError: a test
+    # that skips itself when the signature drifts protects nothing, and this one guards a defect
+    # that cost a node.
+    cfg = {"train_batch_size": 8, "max_prompt_length": 2048, "max_response_length": 8192,
+           "model": "/m", "lora_rank": 128, "lora_alpha": 128, "lr": 1e-6, "kl": 0.03,
+           "kl_loss_coef": 0.03, "val_file": "/v.parquet", "ckpt_root": "/c", "exp": "e",
+           "n_gpus": 2, "tp": 2, "tp_size": 2, "gpu_mem": 0.35, "mini_bs": 4, "micro_bs": 1,
+           "ppo_mini_batch_size": 4, "rollout_n": 6, "project": "p", "reward_path": "/r.py",
+           "steps_per_cycle": 10, "total_epochs": 20}
+    cmd = A._train_cmd(cfg, "/t.parquet", 10)
+    assert "reward_model.use_reward_loop=False" in cmd, (
+        "the rollout-side reward path is enabled again; every kernel would be benchmarked twice")
+
+
+def test_the_upstream_default_is_still_the_one_we_are_overriding():
+    """If upstream ever flips this default, the override becomes a no-op worth re-checking
+    rather than a silent redundancy."""
+    import yaml
+    cfg_path = os.path.join(REPO, "verl", "trainer", "config", "_generated_ppo_trainer.yaml")
+    with open(cfg_path) as f:
+        defined = yaml.safe_load(f)
+    assert defined["reward_model"]["use_reward_loop"] is True, (
+        "upstream no longer defaults use_reward_loop to true — re-check whether the override "
+        "is still needed, and whether the manager path is still the one that prints")
