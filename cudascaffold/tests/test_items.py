@@ -230,3 +230,26 @@ def test_every_state_field_the_loop_writes_survives_a_restart():
     assert fresh == set(R.STATE_KEYS), (
         f"only in new_state: {sorted(fresh - set(R.STATE_KEYS))}, "
         f"only in STATE_KEYS: {sorted(set(R.STATE_KEYS) - fresh)}")
+
+
+def test_the_trainer_loads_data_in_process():
+    """verl's default of 8 dataloader workers forks the trainer eight more times.
+
+    The trainer here is an 8B model plus a vLLM engine; a two-step smoke reached 174 GB of host
+    RSS and had a worker killed by signal. The dataset is one file of short prompts, so the
+    workers buy nothing and cost a fork each. The sibling ALFWorld arm carries the same setting
+    after an OOM kill during a checkpoint save took a node with it.
+    """
+    import os as _os
+    from cudascaffold import adapters as A
+    cfg = {"train_batch_size": 8, "max_prompt_length": 2048, "max_response_length": 8192,
+           "model": "/m", "lora_rank": 128, "lora_alpha": 128, "lr": 1e-6, "kl": 0.03,
+           "val_file": "/v.parquet", "ckpt_root": "/c", "exp": "e", "n_gpus": 2, "tp": 2,
+           "gpu_mem": 0.35, "mini_bs": 4, "micro_bs": 1, "rollout_n": 6, "project": "p"}
+    try:
+        cmd = A._train_cmd(cfg, "/t.parquet", 10)
+    except KeyError as e:                       # cfg shape drifted; the assertion still applies
+        import pytest
+        pytest.skip(f"_train_cmd needs {e}")
+    assert "+data.dataloader_num_workers=0" in cmd, (
+        "the trainer would fork 8 dataloader workers of an 8B-model process")

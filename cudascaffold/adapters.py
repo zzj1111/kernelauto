@@ -150,6 +150,13 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=999999):
         f"data.train_files={train_file}",
         f"data.val_files={cfg['val_file']}",
         f"data.train_batch_size={cfg['train_batch_size']}",
+        # Load the dataset in the trainer process. verl's default of 8 dataloader workers forks
+        # the trainer eight more times, and the trainer here is an 8B model plus a vLLM engine —
+        # measured at 174 GB of host RSS in a two-step smoke, where a worker was then killed by
+        # signal mid-run. The dataset is one file of short prompts, so the workers buy nothing.
+        # The sibling ALFWorld arm carries the same line for the same reason, after an OOM kill
+        # during a checkpoint save took a whole node with it.
+        f"+data.dataloader_num_workers={cfg.get('dataloader_workers', 0)}",
         f"data.max_prompt_length={cfg['max_prompt_length']}",
         f"data.max_response_length={cfg['max_response_length']}",
         f"actor_rollout_ref.model.path={cfg['model']}",
