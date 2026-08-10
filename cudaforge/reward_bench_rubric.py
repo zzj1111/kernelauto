@@ -63,13 +63,18 @@ class _NodeSlots:
                         f.close()
                 if fd is None:
                     if deadline is not None and time.time() > deadline:
-                        # Never block a batch forever on a wedged node: proceed uncapped rather
-                        # than deadlock, and say so, because this is the signal that slots are
-                        # held by processes that will not exit.
-                        print(f"[CudaForge] waited {timeout}s for one of {self.n} runner slots in "
-                              f"{self.dir}; proceeding UNCAPPED — check for stuck processes")
-                        yield None
-                        return
+                        # Every slot is held and none came free, which means the holders are not
+                        # finishing. On this workload the reason is a wedged GPU driver, where
+                        # scorers sit in uninterruptible sleep forever. Proceeding uncapped would
+                        # add processes to exactly the pile that is already stuck — how a slow
+                        # node becomes a rebooted one. Fail loudly instead: the trainer surfaces
+                        # it, the run stops, and the machine is left recoverable.
+                        raise RuntimeError(
+                            f"no kernel_runner slot in {timeout}s: all {self.n} slots in "
+                            f"{self.dir} are held and none are being released. The usual cause is "
+                            f"scorers stuck in D state on a wedged GPU driver — check "
+                            f"`ps -eo state= | grep -c D` before restarting, and do not raise the "
+                            f"cap to work around this.")
                     time.sleep(_SLOT_WAIT_S)
             yield fd
         finally:

@@ -108,22 +108,26 @@ def test_a_slot_is_released_when_its_holder_dies(tmp_path):
     assert time.time() - t0 < 30
 
 
-def test_it_proceeds_rather_than_deadlocking_a_wedged_node(tmp_path, capsys):
-    """If slots are held by processes that will never exit, a batch must not hang forever."""
+def test_it_fails_loudly_rather_than_adding_to_a_stuck_pile(tmp_path):
+    """When no slot frees up, the answer is to stop — not to proceed uncapped.
+
+    Slots stay held only when their holders never finish, which on this workload means scorers
+    in uninterruptible sleep on a wedged GPU driver. Adding more processes there is how a slow
+    node becomes a rebooted one, so exceeding the wait must end the run, loudly, leaving the
+    machine recoverable.
+    """
     import importlib.util
-    slot_dir = str(tmp_path / "slots")
     os.environ["CUDAFORGE_MAX_CONCURRENT_RUNNERS"] = "1"
-    os.environ["CUDAFORGE_SLOT_DIR"] = slot_dir
+    os.environ["CUDAFORGE_SLOT_DIR"] = str(tmp_path / "slots")
     os.environ["CUDAFORGE_SLOT_POLL_SEC"] = "0.02"
     spec = importlib.util.spec_from_file_location(
         "rbr", os.path.join(CUDAFORGE, "reward_bench_rubric.py"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
-    with m._RUNNER_SLOTS.acquire(timeout=30):          # occupy the only slot in-process
-        capsys.readouterr()
-        with m._RUNNER_SLOTS.acquire(timeout=0.2) as got:
-            assert got is None, "a second acquire should have given up, not blocked"
-        assert "UNCAPPED" in capsys.readouterr().out, "giving up must be announced"
+    with m._RUNNER_SLOTS.acquire(timeout=30):
+        with pytest.raises(RuntimeError, match="no kernel_runner slot"):
+            with m._RUNNER_SLOTS.acquire(timeout=0.2):
+                pass
 
 
 def test_the_two_rewards_cannot_cap_differently(tmp_path):

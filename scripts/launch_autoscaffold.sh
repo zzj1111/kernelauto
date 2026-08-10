@@ -106,4 +106,37 @@ echo "n_cycles=$N_CYCLES"
 echo "==============================="
 
 cd "$ROOT"
+
+# ---- safety gate: prove the runner cap holds BEFORE any GPU work ----------------------------
+#
+# This exists because a comment was trusted instead of tested. The cap on concurrent
+# kernel_runner subprocesses read "HARD CAP ... at once", but it was a threading.Semaphore —
+# per process — while verl runs the reward in reward_model.num_workers separate actors. The
+# real limit was 8x the number written down, and it took a shared node out twice before anyone
+# checked. The check costs about four seconds and uses no GPU.
+#
+# Set ARM_SKIP_SAFETY_GATE=1 only if you have another way to know the cap holds.
+if [[ "${ARM_SKIP_SAFETY_GATE:-0}" != "1" ]]; then
+  echo "[safety] verifying the runner cap holds across processes..."
+  if ! "$PY" -m pytest cudaforge/tests/test_node_wide_slots.py -q -x \
+        -p no:cacheprovider >/tmp/arm_safety_gate.log 2>&1; then
+    echo "" >&2
+    echo "REFUSING TO LAUNCH: the concurrency cap does not hold across processes." >&2
+    echo "Every scorer would spawn up to the cap independently, and this workload wedges" >&2
+    echo "the GPU driver when it does — see /tmp/arm_safety_gate.log" >&2
+    exit 1
+  fi
+  # Nothing may already be holding slots: an earlier batch that never exited means the node is
+  # still sick, and starting now piles onto processes that cannot be killed.
+  stuck=$(ps -eo state= 2>/dev/null | grep -c D || echo 0)
+  if (( stuck > 20 )); then
+    echo "" >&2
+    echo "REFUSING TO LAUNCH: $stuck processes are in uninterruptible sleep." >&2
+    echo "That is the signature of a wedged GPU driver; they do not take SIGKILL." >&2
+    echo "Wait for them to drain or reboot the node before starting a run." >&2
+    exit 1
+  fi
+  echo "[safety] cap verified; $stuck processes in D state"
+fi
+
 exec "$PY" -m cudascaffold.run_arm "$N_CYCLES"
