@@ -365,8 +365,41 @@ IMPORTANT:
 _THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL | re.IGNORECASE)
 
 
+# Chat control tokens. These must never survive into a candidate: their presence means the
+# generation did not stop where the template says a turn ends, so everything after the first one
+# is text the model emitted past its own terminator.
+_CONTROL_TOKENS = ("<|endoftext|>", "<|im_end|>", "<|im_start|>", "<|eot_id|>")
+
+
+def _cut_at_control_token(text: str) -> Tuple[str, Optional[str]]:
+    """Truncate at the first chat control token. Returns (text, the token found or None).
+
+    The stop-token set lives in the model's generation_config and is a property of the CHECKPOINT,
+    not of the dataset — but whether the model actually emits a given terminator depends on the
+    prompt format, so a set that is right for one corpus can be wrong for the next, silently. This
+    checkpoint ships an "eosfix" that removes <|endoftext|> from the stop set, which is correct
+    for the current data (measured: 1177 scored candidates, zero control tokens, no length
+    clipping) and may not be for the next. Rather than trust the config, cut here: the compiler
+    would otherwise be handed whatever followed the terminator as part of the kernel.
+    """
+    first = None
+    for tok in _CONTROL_TOKENS:
+        i = text.find(tok)
+        if i >= 0 and (first is None or i < first[1]):
+            first = (tok, i)
+    if first is None:
+        return text, None
+    return text[:first[1]], first[0]
+
+
 def _extract_python_code(solution_str: str) -> str:
     body = _THINK_RE.sub("", solution_str or "")
+    body, stray = _cut_at_control_token(body)
+    if stray:
+        # Loud on purpose: this is the symptom of a stop-token set that does not match the data,
+        # and it is otherwise invisible — the candidate simply compiles a little worse.
+        print(f"[CudaForge] control token {stray!r} inside a generation — the stop-token set "
+              f"does not match this data; truncated there")
     m = _CODEBLOCK_RE.search(body)
     if m:
         return m.group(1).strip()

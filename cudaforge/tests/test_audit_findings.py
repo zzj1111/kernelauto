@@ -226,3 +226,43 @@ def test_a_timeout_removes_the_build_directory_it_abandoned(reward_src, monkeypa
     assert not os.path.exists(created["dir"]), (
         "the abandoned build directory survived; the identical-source retry would wait on a "
         "lock nobody will drop")
+
+
+# ---- the stop-token set is a property of the checkpoint, not of the data ----------------------
+#
+# generation_config decides where a generation stops. This checkpoint ships an "eosfix" that
+# removes <|endoftext|> from the stop set, keeping only <|im_end|>. That is correct for the
+# current corpus — 1177 scored candidates carried no control token and nothing hit the length cap
+# — but whether a model emits a given terminator depends on the prompt format, so the same set
+# can be wrong for the next dataset, and the failure is silent: the compiler is simply handed
+# whatever the model wrote after its own terminator.
+
+@pytest.mark.parametrize("tok", ["<|endoftext|>", "<|im_end|>", "<|im_start|>", "<|eot_id|>"])
+def test_a_control_token_truncates_the_candidate(reward_src, tok, capsys):
+    raw = f"import torch\ndef f():\n    return 1\n{tok}\nGARBAGE THAT IS NOT CODE"
+    out = reward_src._extract_python_code(raw)
+    assert "GARBAGE" not in out, (
+        f"text after {tok} reached the compiler as part of the kernel")
+    assert "def f()" in out, "the real candidate was lost along with the trailing text"
+
+
+def test_the_mismatch_is_reported_not_swallowed(reward_src, capsys):
+    capsys.readouterr()
+    reward_src._extract_python_code("import torch<|endoftext|>trailing")
+    assert "control token" in capsys.readouterr().out, (
+        "a stop-token set that does not match the data is invisible unless it says so")
+
+
+def test_ordinary_generations_are_untouched(reward_src, capsys):
+    """The guard must not alter the normal path — every candidate goes through it."""
+    raw = "```python\nimport torch\n\nclass ModelNew(torch.nn.Module):\n    pass\n```"
+    capsys.readouterr()
+    out = reward_src._extract_python_code(raw)
+    assert out == "import torch\n\nclass ModelNew(torch.nn.Module):\n    pass"
+    assert "control token" not in capsys.readouterr().out
+
+
+def test_the_first_control_token_wins(reward_src):
+    """Whichever terminator appears first is where the generation actually ended."""
+    out = reward_src._extract_python_code("a=1\n<|im_end|>\nb=2\n<|endoftext|>\nc=3")
+    assert "b=2" not in out and "c=3" not in out
