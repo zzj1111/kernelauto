@@ -40,7 +40,7 @@ ninja==1.13.0
 
 # --- rollout backend (StitchCUDA launches with actor_rollout_ref.rollout.name=vllm) ---
 vllm==0.11.0
-flashinfer-python==0.3.1
+flashinfer-python==0.6.16.post2
 fastapi==0.124.0
 uvicorn==0.38.0
 
