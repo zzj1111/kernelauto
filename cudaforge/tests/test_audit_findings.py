@@ -179,6 +179,9 @@ def _ext_dir_for(reward_src, monkeypatch, solution, visible="3"):
         return _P()
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    # These assert build-directory isolation, not node health. The watchdog has its own tests
+    # and would otherwise stop this one on a machine whose driver is currently wedged.
+    monkeypatch.setattr(reward_src, "_abort_if_node_is_wedging", lambda: None)
     monkeypatch.setattr(reward_src.subprocess, "run", fake_run)
     reward_src.bench(solution, "class Model: pass")
     return seen["env"]["TORCH_EXTENSIONS_DIR"]
@@ -220,6 +223,7 @@ def test_a_timeout_removes_the_build_directory_it_abandoned(reward_src, monkeypa
         created["dir"] = d
         raise _sp.TimeoutExpired(cmd="runner", timeout=1)
 
+    monkeypatch.setattr(reward_src, "_abort_if_node_is_wedging", lambda: None)
     monkeypatch.setattr(reward_src.subprocess, "run", fake_run)
     correctness, speedup = reward_src.bench("class ModelNew:\n    pass", "class Model: pass")
     assert (correctness, speedup) == (0, 0.0)

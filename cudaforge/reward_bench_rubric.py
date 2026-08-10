@@ -39,6 +39,51 @@ _SLOT_WAIT_S = float(os.environ.get("CUDAFORGE_SLOT_POLL_SEC", "0.5"))
 _SLOT_TIMEOUT_S = float(os.environ.get("CUDAFORGE_SLOT_TIMEOUT_SEC", "1800"))
 
 
+# A run can start healthy and go bad: today's 85 runners appeared inside 49 seconds. The launch
+# gate cannot see that, so the same signature is checked while the batch runs — cheaply, from
+# /proc only, and at most once every few seconds. Processes in uninterruptible sleep are the
+# symptom that matters here: they are waiting on the GPU driver's global rwsem, they do not take
+# SIGKILL, and every additional context creation lengthens the queue they are stuck in.
+_D_STATE_LIMIT = int(os.environ.get("CUDAFORGE_MAX_D_STATE", "40"))
+_D_STATE_EVERY_S = float(os.environ.get("CUDAFORGE_D_STATE_POLL_SEC", "5"))
+_d_state_checked_at = [0.0]
+_d_state_lock = __import__("threading").Lock()
+
+
+def _count_uninterruptible():
+    """How many processes on this node are in D state. /proc only — no driver calls, which is
+    the point: nvidia-smi itself hangs once the driver is wedged."""
+    n = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as f:
+                data = f.read()
+            # state is the field after the (comm) parenthesis, which may itself contain spaces
+            if data[data.rindex(b")") + 2: data.rindex(b")") + 3] == b"D":
+                n += 1
+        except (OSError, ValueError):
+            continue
+    return n
+
+
+def _abort_if_node_is_wedging():
+    now = time.time()
+    with _d_state_lock:
+        if now - _d_state_checked_at[0] < _D_STATE_EVERY_S:
+            return
+        _d_state_checked_at[0] = now
+    stuck = _count_uninterruptible()
+    if stuck > _D_STATE_LIMIT:
+        raise RuntimeError(
+            f"{stuck} processes are in uninterruptible sleep (limit {_D_STATE_LIMIT}). That is "
+            f"the GPU driver's lock queue backing up; these processes do not take SIGKILL and "
+            f"every new CUDA context makes the queue longer. Stopping this batch so the node "
+            f"stays recoverable. Set CUDAFORGE_MAX_D_STATE to change the threshold, but check "
+            f"`ps -eo state= | grep -c D` first.")
+
+
 class _NodeSlots:
     """A counting semaphore shared by every process on this node, backed by flock."""
 
@@ -48,6 +93,9 @@ class _NodeSlots:
     @contextlib.contextmanager
     def acquire(self, timeout=None):
         import fcntl
+        # Checked before taking a slot, not after: the point is to stop ADDING to a queue that
+        # is already backing up.
+        _abort_if_node_is_wedging()
         os.makedirs(self.dir, exist_ok=True)
         deadline = None if timeout is None else time.time() + timeout
         fd = None

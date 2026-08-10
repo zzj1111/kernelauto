@@ -34,6 +34,9 @@ def _child(slot_dir, n, hold_s, out_path):
         os.environ["CUDAFORGE_MAX_CONCURRENT_RUNNERS"] = "{n}"
         os.environ["CUDAFORGE_SLOT_DIR"] = {slot_dir!r}
         os.environ["CUDAFORGE_SLOT_POLL_SEC"] = "0.02"
+        # These exercise slot semantics, not node health; the watchdog has its own tests and
+        # would otherwise refuse to run at all on a machine that is currently wedged.
+        os.environ["CUDAFORGE_MAX_D_STATE"] = "100000"
         spec = importlib.util.spec_from_file_location(
             "rbr", os.path.join({CUDAFORGE!r}, "reward_bench_rubric.py"))
         m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -91,6 +94,7 @@ def test_a_slot_is_released_when_its_holder_dies(tmp_path):
         import importlib.util, os, time
         os.environ["CUDAFORGE_MAX_CONCURRENT_RUNNERS"] = "1"
         os.environ["CUDAFORGE_SLOT_DIR"] = {slot_dir!r}
+        os.environ["CUDAFORGE_MAX_D_STATE"] = "100000"
         spec = importlib.util.spec_from_file_location(
             "rbr", os.path.join({CUDAFORGE!r}, "reward_bench_rubric.py"))
         m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -120,6 +124,7 @@ def test_it_fails_loudly_rather_than_adding_to_a_stuck_pile(tmp_path):
     os.environ["CUDAFORGE_MAX_CONCURRENT_RUNNERS"] = "1"
     os.environ["CUDAFORGE_SLOT_DIR"] = str(tmp_path / "slots")
     os.environ["CUDAFORGE_SLOT_POLL_SEC"] = "0.02"
+    os.environ["CUDAFORGE_MAX_D_STATE"] = "100000"
     spec = importlib.util.spec_from_file_location(
         "rbr", os.path.join(CUDAFORGE, "reward_bench_rubric.py"))
     m = importlib.util.module_from_spec(spec)
@@ -145,3 +150,56 @@ def test_the_two_rewards_cannot_cap_differently(tmp_path):
     assert a._MAX_CONCURRENT == b._MAX_CONCURRENT
     assert a._RUNNER_SLOTS.dir == b._RUNNER_SLOTS.dir, \
         "the two rewards would queue on different slot directories, so neither caps the other"
+
+
+# ---- the run must also stop itself when the node starts wedging ------------------------------
+#
+# The launch gate only looks once. Today's 85 runners appeared inside 49 seconds, so a run can
+# start healthy and destroy the node before it finishes. Processes in uninterruptible sleep are
+# the signature: they are queued on the GPU driver's global rwsem, they do not take SIGKILL, and
+# every additional CUDA context lengthens that queue.
+
+def _reward(monkeypatch, **env):
+    import importlib.util
+    for k, v in env.items():
+        monkeypatch.setenv(k, str(v))
+    spec = importlib.util.spec_from_file_location(
+        "rbr", os.path.join(CUDAFORGE, "reward_bench_rubric.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_the_d_state_count_matches_the_kernel(monkeypatch):
+    """Counted from /proc, deliberately: nvidia-smi hangs once the driver is wedged, so the
+    watchdog must not depend on anything that talks to the driver."""
+    m = _reward(monkeypatch)
+    ours = m._count_uninterruptible()
+    ps = int(subprocess.run("ps -eo state= | grep -c D || true", shell=True,
+                            capture_output=True, text=True).stdout.strip() or 0)
+    assert abs(ours - ps) <= 3, f"our count {ours} vs ps {ps}"
+
+
+def test_a_backing_up_node_stops_the_batch(monkeypatch, tmp_path):
+    m = _reward(monkeypatch, CUDAFORGE_MAX_D_STATE=0, CUDAFORGE_SLOT_DIR=str(tmp_path / "s"),
+                CUDAFORGE_MAX_CONCURRENT_RUNNERS=4)
+    monkeypatch.setattr(m, "_count_uninterruptible", lambda: 999)
+    with pytest.raises(RuntimeError, match="uninterruptible sleep"):
+        with m._RUNNER_SLOTS.acquire(timeout=5):
+            pass
+
+
+def test_a_healthy_node_is_not_blocked(monkeypatch, tmp_path):
+    m = _reward(monkeypatch, CUDAFORGE_MAX_D_STATE=40, CUDAFORGE_SLOT_DIR=str(tmp_path / "s2"),
+                CUDAFORGE_MAX_CONCURRENT_RUNNERS=4)
+    monkeypatch.setattr(m, "_count_uninterruptible", lambda: 3)
+    with m._RUNNER_SLOTS.acquire(timeout=5) as fd:
+        assert fd is not None
+
+
+def test_the_check_is_before_the_slot_not_after(monkeypatch, tmp_path):
+    """Stopping matters only if it happens before another context is created."""
+    src = open(os.path.join(CUDAFORGE, "reward_bench_rubric.py"), encoding="utf-8").read()
+    body = src[src.index("    def acquire(self, timeout=None):"):]
+    assert body.index("_abort_if_node_is_wedging()") < body.index("fcntl.flock"), \
+        "the watchdog fires after a slot is taken, which is one context too late"

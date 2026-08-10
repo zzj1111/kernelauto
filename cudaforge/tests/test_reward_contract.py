@@ -141,6 +141,9 @@ def test_bench_never_lets_a_non_finite_speedup_out(reward_src, monkeypatch, caps
 
     for raw in (float("nan"), float("inf"), float("-inf")):
         payload = {"ok": True, "correct": True, "speedup": raw}
+        # Asserting what bench() returns, not whether the node is healthy — the watchdog has
+        # its own tests and would stop this one on a currently-wedged machine.
+        monkeypatch.setattr(reward_src, "_abort_if_node_is_wedging", lambda: None)
         monkeypatch.setattr(_sp, "run", lambda *a, **k: _P(payload))
         monkeypatch.setattr(reward_src.subprocess, "run", lambda *a, **k: _P(payload))
         correctness, speedup = reward_src.bench("class ModelNew: pass", "class Model: pass")
