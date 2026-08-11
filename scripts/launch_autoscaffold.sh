@@ -18,8 +18,8 @@ Placement / hardware
   --n-gpus N                 how many of --gpus verl trains on      (env ARM_N_GPUS,      default 2)
   --tp N                     rollout tensor-parallel size           (env ARM_TP,          default 2)
   --reward-gpu ID            GPU for the kernel benchmark subprocess (env ARM_REWARD_GPU,  default 3)
-  --arch-list LIST           TORCH_CUDA_ARCH_LIST for your GPU       (env ARM_TORCH_CUDA_ARCH_LIST, default 9.0)
-                              (H100/H200=9.0, A100=8.0, 4090=8.9 — check: nvidia-smi --query-gpu=compute_cap)
+  --arch-list LIST           TORCH_CUDA_ARCH_LIST override           (env ARM_TORCH_CUDA_ARCH_LIST, default: auto-detect
+                              from the driver — H100/H200=9.0, B200=10.0. Only set this for cross-compiling.)
 
 Toolchain
   --venv-python PATH          interpreter to run verl/vllm with       (env ARM_PYTHON, default: this script's own \$PATH resolution of python3)
@@ -99,7 +99,7 @@ fi
 
 echo "=== launch_autoscaffold.sh ==="
 echo "root=$ROOT exp=${ARM_EXP:-cuda_scaffold_8b} gpus=${ARM_GPUS:-0,1} reward_gpu=${ARM_REWARD_GPU:-3}"
-echo "model=${ARM_MODEL:-<default>} domain=${ARM_DOMAIN:-cuda} arch_list=${ARM_TORCH_CUDA_ARCH_LIST:-9.0}"
+echo "model=${ARM_MODEL:-<default>} domain=${ARM_DOMAIN:-cuda} arch_list=${ARM_TORCH_CUDA_ARCH_LIST:-auto-detect}"
 echo "python=$PY cuda_home=$CUDA_HOME"
 echo "rubric_url=${RUBRIC_VLLM_URL:-http://127.0.0.1:8210/v1/chat/completions}"
 echo "n_cycles=$N_CYCLES"

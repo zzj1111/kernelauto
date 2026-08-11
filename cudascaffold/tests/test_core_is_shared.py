@@ -46,7 +46,9 @@ def _sha(path):
 # 2026-08-11 observation.py: single-turn failure evidence (fail_kinds / sample_error /
 # speedup_when_correct) and the held-out per-category breakdown in the valid_seen description.
 # If the peer ever unfreezes, copy these files THERE and empty this set.
-DIVERGED_FROM_FROZEN_PEER = {"observation.py"}
+# 2026-08-11 scaffold.py: the target-GPU domain fact is now driver-detected (was a hardcoded
+# H200/sm_90, wrong on the incoming B200s).
+DIVERGED_FROM_FROZEN_PEER = {"observation.py", "scaffold.py"}
 
 
 @pytest.mark.parametrize("name", CORE)

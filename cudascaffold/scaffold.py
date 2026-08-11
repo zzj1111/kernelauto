@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import os
+import subprocess
 
 class Domain:
     """FACTS about a training domain's structure — never advice about what scaffold to use.
@@ -89,6 +90,29 @@ TASK_INFO = {
     "pick_cool_then_place_in_recep": "Find object X, cool it with the fridge, then put it in/on receptacle Y.",
     "pick_clean_then_place_in_recep": "Find object X, clean it at the sinkbasin, then put it in/on receptacle Y.",
 }
+
+def _gpu_fact(suffix=""):
+    """The domain-facts sentence naming the target GPU, detected from the driver.
+
+    Was a hardcoded "H200 (Hopper, sm_90)" — harmless while every run WAS that machine, and
+    wrong the moment the B200s arrive: the Teacher would write Hopper-specific guidance
+    (tensor-core shapes, smem sizes) against Blackwell silicon. ARM_GPU_DESC overrides for
+    cross-compile setups; detection failure falls back to naming nothing rather than lying.
+    """
+    desc = os.environ.get("ARM_GPU_DESC")
+    if not desc:
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10)
+            name, cap = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")[:2]]
+            fam = {"7": "Volta", "8": "Ampere/Ada", "9": "Hopper",
+                   "10": "Blackwell", "12": "Blackwell"}.get(cap.split(".")[0], "")
+            sm = "sm_" + cap.replace(".", "")
+            desc = f"{name} ({fam + ', ' if fam else ''}{sm})"
+        except Exception:
+            return "The target GPU is the one this run's driver reports" + suffix + "."
+    return f"The target GPU is an {desc}" + suffix + "."
 
 # The action primitives that exist in ALFWorld (facts about the env, not advice).
 ACTION_PRIMITIVES = [
@@ -303,7 +327,7 @@ TRITON_DOMAIN = Domain(
         "real kernel from an answer that avoided writing one.",
         "Compilation failure, an incorrect result, and a timeout are all scored 0 — they are "
         "indistinguishable in the reward.",
-        "The target GPU is an NVIDIA H200 (Hopper, sm_90).",
+        _gpu_fact(),
         "All 600 training rows have DISTINCT task_names, so an instance recurs only once per "
         "epoch — roughly two or three times across a 200-step run at batch 8. Per-instance text "
         "is mechanically available but reaches far less repetition than a category-level scope "
@@ -1014,8 +1038,7 @@ CUDA_DOMAIN = Domain(
         "categories have an effect you cannot measure directly — which is not the same as an "
         "effect of zero, and reasoning as if it were is how 44% of the training data ends up "
         "written off.",
-        "The target GPU is an NVIDIA H200 (Hopper, sm_90); its specifications are already stated "
-        "in every prompt.",
+        _gpu_fact("; its specifications are already stated in every prompt"),
         "An instance is identified by its task_name (e.g. '27_RegNet'). About 120 distinct "
         "task_names cover the 156 improvement rows, so most instances appear once or twice per "
         "epoch rather than many times — per-instance text reaches a narrow slice. The 200 scratch "
