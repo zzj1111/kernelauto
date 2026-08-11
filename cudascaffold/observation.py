@@ -182,7 +182,11 @@ _SIGNAL_MEANINGS = (
     "all-succeed means it is already solved and text buys nothing there. `unit` and "
     "`rollout_n_median` travel with the number so you can see what a group is here.\n"
     "- signals.valid_seen = the held-out standalone success (the objective). Read-only: you "
-    "cannot see or optimize the final test set (unseen); this is the validation signal.\n"
+    "cannot see or optimize the final test set (unseen); this is the validation signal. "
+    "`per_task` breaks the same bare held-out run down by category (`per_task_n` gives each "
+    "category's sample count) — unlike per_task_gap it is measured on held-out problems at "
+    "n≈30 per category, so it is the more trustworthy read on WHERE the policy is weak, "
+    "while per_task_gap remains the only read on what your current text CHANGES.\n"
     "- signals.eval_trajectory = that same held-out number across ALL cycles so far: `series` "
     "(step, value, and the individual `draws` behind that average), `deltas` (cycle-over-cycle "
     "change), `last_delta`, and `best`. The draws are repeats on the SAME weights, so their "
@@ -581,8 +585,18 @@ TRACE_MULTI_TURN = (
 TRACE_SINGLE_TURN = (
     "- failure_trajectories = the instances this cycle trained on that the bare policy "
     "scored worst, with their measured correct-rate over the group. One attempt is one "
-    "answer, so there is no step sequence to walk through — what the list tells you is "
-    "WHICH problems the policy is failing, not where inside an episode it went wrong.\n"
+    "answer, so there is no step sequence to walk through — the list tells you WHICH "
+    "problems the policy is failing and, when present, WHY: `fail_kinds` counts the "
+    "runner's verdict per failed attempt (compile_error / runtime_error / "
+    "correctness_error / timeout / major_hacking), and `sample_error` is one verbatim "
+    "error message from those attempts, shortest first. The kinds call for different "
+    "text: compile errors are API or syntax habits, runtime errors are launch or memory "
+    "bugs, correctness errors are algorithmic, timeouts are usually a hanging build, and "
+    "major_hacking means the judge saw the candidate game the check rather than solve the "
+    "problem. `speedup_when_correct` rides along where the instance sometimes passed, "
+    "because a category can be failing on SPEED while passing on correctness. Absence of "
+    "`fail_kinds` on an instance means its lines predate this field, not that it failed "
+    "for no reason.\n"
 )
 
 

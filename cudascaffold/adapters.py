@@ -260,6 +260,11 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=-1):
         "trainer.nnodes=1",
         f"trainer.default_local_dir={cfg['ckpt_root']}",
         f"trainer.save_freq={cfg['steps_per_cycle']}",
+        # A checkpoint is ~36G and every cycle writes one; unbounded retention filled the 868G
+        # root disk to 100% on 2026-08-10 and killed the save in progress. Two is the minimum
+        # with a fallback: verl advances latest_checkpointed_iteration.txt only after a COMPLETED
+        # save, so keeping N and N-1 covers a save cut off mid-write.
+        f"trainer.max_actor_ckpt_to_keep={cfg.get('max_ckpt_keep', 2)}",
         f"trainer.test_freq={test_freq}",
         f"trainer.total_training_steps={to_step}",
         "trainer.resume_mode=auto",
@@ -377,14 +382,23 @@ def eval_adapter(checkpoint, val_n, cfg):
     step = int(str(checkpoint).rstrip("/").split("global_step_")[-1])
     if val_n > 1 and os.environ.get("ARM_EVAL_SEPARATE_DRAWS", "0") != "1":
         return _eval_merged(checkpoint, step, val_n, cfg)
-    draws, pers = [], []
+    draws, pers, pers_n = [], [], []
     for d in range(val_n):
         elog = os.path.join(cfg["log_dir"], f"{cfg['exp']}_eval_s{step}_d{d}.log")
         env = base_env(cfg)
         env["VLLM_SEED"] = str(d)
+        off = worker_log_offsets(cfg)
         cmd = _train_cmd(cfg, cfg["val_file"], step, val_before=True, test_freq=1)
         _run(cmd + " trainer.val_only=True", elog, env)
         sr, per = parse_val(elog)
+        # parse_val keys on verl's data_source, and this dataset has ONE of those — a breakdown
+        # with one key cannot say which category is weak, so the Teacher was diagnosing
+        # categories from the training rollouts alone (n≈12-24) while 180 bare held-out answers
+        # sat unread in the worker logs. Scrape those instead; data_source stays the fallback.
+        by_cat = per_category_from_log(off)
+        if by_cat:
+            per = {c: v["correct_rate"] for c, v in by_cat.items()}
+            pers_n.append({c: v["n"] for c, v in by_cat.items()})
         if sr is not None:
             draws.append(sr)
             pers.append(per)
@@ -395,8 +409,13 @@ def eval_adapter(checkpoint, val_n, cfg):
     avg = round(sum(draws) / len(draws), 4)
     keys = sorted({k for p in pers for k in p})
     per_task = {k: round(sum(p.get(k, 0.0) for p in pers) / len(pers), 4) for k in keys}
-    return {"avg": avg, "per_task": per_task, "draws": [round(x, 4) for x in draws],
-            "n_draws": len(draws), "n_draws_requested": val_n}
+    out = {"avg": avg, "per_task": per_task, "draws": [round(x, 4) for x in draws],
+           "n_draws": len(draws), "n_draws_requested": val_n}
+    if pers_n:
+        out["per_task_n"] = {k: max(p.get(k, 0) for p in pers_n) for k in keys}
+        out["per_task_unit"] = ("held-out correct-rate per category, bare prompt; "
+                                "n = candidates scored per draw")
+    return out
 
 
 def _eval_merged(checkpoint, step, val_n, cfg):
@@ -429,7 +448,10 @@ def _eval_merged(checkpoint, step, val_n, cfg):
             e = dict(x)
             cat = SP.level_of(e, None) or "unlabelled"
             e["category"] = f"{cat}{_ARM_SEP}d{d}"
-            e["task_name"] = f"{e.get('task_name')}{_ARM_SEP}d{d}"
+            # Row id for the same reason measure_ab_adapter stamps one: verl pads validation
+            # batches by repeating rows, and an untagged repeat is indistinguishable from the
+            # legitimate copy of the same task in another draw.
+            e["task_name"] = f"{e.get('task_name')}{_ROW_MARK}{len(rows)}{_ARM_SEP}d{d}"
             rows.append(e)
         df["extra_info"] = rows
         frames.append(df)
@@ -671,6 +693,7 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
     import collections
     txt = _read_since(offsets)
     per_task = collections.defaultdict(list)
+    fails_of = collections.defaultdict(list)   # task -> [(kind, err)] from failed rollouts
     cat_of = {}
     for m in REWARD_LINE.finditer(txt):
         correct, speedup, _ds, task, level, category, _reward = m.groups()
@@ -684,6 +707,10 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
         except ValueError:
             continue
         per_task[task].append((int(correct == "1"), r))
+        if correct != "1":
+            kind, err = _fail_of(txt, m)
+            if kind:
+                fails_of[task].append((kind, err))
         cat_of[task] = cat
 
     sizes = collections.Counter(len(v) for v in per_task.values())
@@ -698,9 +725,11 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
         if task not in fired:          # not part of this cycle's parquet -> not our experiment
             continue
         arm = "injected" if fired[task] else "bare"
-        g = gap.setdefault(cat, {"bare": [0, 0], "injected": [0, 0]})
+        g = gap.setdefault(cat, {"bare": [0, 0], "injected": [0, 0],
+                                 "sp_bare": [], "sp_injected": []})
         g[arm][0] += sum(c for c, _ in results)
         g[arm][1] += len(results)
+        g["sp_" + arm].extend(r for c, r in results if c == 1)
         z = zero_grad.setdefault(cat, {"zero_gradient": 0, "all_fail": 0, "all_succeed": 0,
                                        "total": 0})
         z["total"] += 1
@@ -712,13 +741,28 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
     # non-injected groups so that description stays true — the training window holds both arms,
     # and calling a scaffolded failure "bare" would be the same class of error as the signal names
     # this module has already had to correct twice today.
-    failures = sorted(
-        ({"instance": t, "correct_rate": round(sum(c for c, _ in v) / len(v), 4),
-          "n": len(v), "category": cat_of[t]}
-         for t, v in per_task.items()
-         if len(v) == want and not fired.get(t, False)
-         and sum(c for c, _ in v) < len(v)),
-        key=lambda x: (x["correct_rate"], x["instance"]))
+    failures = []
+    for t, v in per_task.items():
+        if len(v) != want or fired.get(t, False) or sum(c for c, _ in v) >= len(v):
+            continue
+        row = {"instance": t, "correct_rate": round(sum(c for c, _ in v) / len(v), 4),
+               "n": len(v), "category": cat_of[t]}
+        # The evidence half, mirroring what contrastive_traces gives the multi-turn domains:
+        # not the trajectory (one attempt is one answer) but WHY the attempts failed — the
+        # runner-reported kind per failed rollout, plus one verbatim error message. The shortest
+        # non-empty message is the sample: compiler and mismatch errors front-load the cause,
+        # and the long ones are stack traces whose useful line is the one the short ones lead with.
+        kinds = collections.Counter(k for k, _ in fails_of.get(t, []))
+        if kinds:
+            row["fail_kinds"] = dict(kinds.most_common())
+            errs = [e for _, e in fails_of.get(t, []) if e]
+            if errs:
+                row["sample_error"] = min(errs, key=len)[:200]
+        sp = [r for c, r in v if c == 1]
+        if sp:
+            row["speedup_when_correct"] = round(sum(sp) / len(sp), 3)
+        failures.append(row)
+    failures.sort(key=lambda x: (x["correct_rate"], x["instance"]))
 
     out_gap = {}
     for cat, g in gap.items():
@@ -730,6 +774,13 @@ def signals_from_training(offsets, fired, rollout_n=None, scaffold=None, domain=
             "unit": "mean per-rollout success, this cycle's training rollouts, "
                     "split by whether p_task fired for that group",
         }
+        # Correctness alone hides this domain's other failure mode: kernels that pass the check
+        # but are no faster than the PyTorch they replace. Median over CORRECT rollouts only,
+        # withheld below 3 samples — at n=1 or 2 a single lucky kernel IS the median.
+        for arm_name in ("bare", "injected"):
+            sp = sorted(g["sp_" + arm_name])
+            row[f"speedup_median_{arm_name}"] = (
+                round(sp[len(sp) // 2], 3) if len(sp) >= 3 else None)
         # Why an arm is empty, because the three causes call for different actions and a bare
         # "gap: null" does not separate them.
         if not i[1] and scaffold is not None:
@@ -1138,6 +1189,22 @@ def signals_adapter(checkpoint, scaffold, cfg, seed):
 
 # Separator folding the A/B arm into the category label so all three arms can share one pass.
 # Chosen because no category or task_name contains it.
+# Optional tail the reward appends AFTER the fields REWARD_LINE captures: why a candidate
+# scored 0 ("fail:compile_error, err:...") . Parsed separately so REWARD_LINE and everything
+# holding offsets into its groups stay byte-compatible with logs from before the field existed.
+_FAIL_TAIL = re.compile(r"fail:([^,\s]+)(?:,\s*err:([^\n]*))?")
+
+
+def _fail_of(txt, match):
+    """(kind, err) from the reward line `match` sits on, or (None, None)."""
+    end = txt.find("\n", match.end())
+    tail = txt[match.end():end if end != -1 else len(txt)]
+    ft = _FAIL_TAIL.search(tail)
+    if not ft:
+        return None, None
+    return ft.group(1), (ft.group(2) or "").strip() or None
+
+
 _ARM_SEP = "@@"
 
 # Marks a task_name as belonging to ONE PARQUET ROW of a measurement pass ("name#r17@@arm").

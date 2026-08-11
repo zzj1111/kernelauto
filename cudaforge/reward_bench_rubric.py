@@ -1076,8 +1076,17 @@ def bench(
     max_jobs: int = 16,
     # extensions cache policy: unique/shared
     ext_dir_mode: str = "shared",
-    # target arch list: H200 = 9.0 (optionally 9.0a if you want)
-    torch_cuda_arch_list: str = "9.0",
+    # None = inherit TORCH_CUDA_ARCH_LIST from the environment, which cudascaffold detects from
+    # the driver and exports. A literal default here would defeat that: the payload value
+    # outranks the env inside kernel_runner, so the old hardcoded "9.0" compiled every candidate
+    # for sm_90 whatever machine this ran on — on sm_100 that is every kernel failing to load.
+    torch_cuda_arch_list: Optional[str] = None,
+    # Written on every failing path with {"fail_kind", "fail_msg"} so the caller can attribute
+    # WHY a candidate scored 0 — the Teacher otherwise sees only that it did.
+    detail_out: Optional[Dict[str, Any]] = None,
+    # Echoed into every jsonl record of this call ({"task_name", "category", "level"}), making
+    # the bench log joinable to instances instead of a trail that cannot answer who failed.
+    attribution: Optional[Dict[str, Any]] = None,
 ):
     t_start = time.time()
 
@@ -1096,7 +1105,18 @@ def bench(
         record.setdefault("pid", pid)
         record.setdefault("elapsed_sec", round(time.time() - t_start, 6))
         record.setdefault("timeout_sec", timeout_sec)
+        for k, v in (attribution or {}).items():
+            if v is not None:
+                record.setdefault(k, v)
         _write_jsonl(log_path, record)
+
+    torch_cuda_arch_list = (torch_cuda_arch_list
+                            or os.environ.get("TORCH_CUDA_ARCH_LIST") or "9.0")
+
+    def _note_fail(kind, msg=""):
+        if detail_out is not None:
+            detail_out["fail_kind"] = kind
+            detail_out["fail_msg"] = " ".join(str(msg or "").split())[:200]
 
     # 1) extract candidate code
     try:
@@ -1165,8 +1185,11 @@ def bench(
     # that produced it instead of to every future candidate with the same extension name.
     vis = env.get("CUDA_VISIBLE_DEVICES", "unknown")
     if ext_dir_mode == "shared":
+        # /dev/shm, not /tmp: /tmp sits on the root disk here, and per-source build dirs with
+        # no pruning filled that disk to 100% on 2026-08-10, killing a checkpoint save. tmpfs is
+        # wiped on reboot and the watchdog prunes stale entries, so the cache stays bounded.
         root = os.environ.get("CUDAFORGE_EXT_CACHE_ROOT",
-                              f"/tmp/torch_ext_cache_reward_cuda{vis}")
+                              f"/dev/shm/torch_ext_cache_reward_cuda{vis}")
         digest = hashlib.sha1((solution_str or "").encode("utf-8", "replace")).hexdigest()[:16]
         ext_dir = os.path.join(root, digest)
     else:
@@ -1308,6 +1331,7 @@ def bench(
             "hint": "Most timeouts are slow/hanging torch extension compile during import_test. Check runner_debug dump timings_ms.import_test.",
         })
         print("[CudaForge bench] timeout (see jsonl log):", log_path)
+        _note_fail("timeout", f"runner exceeded {timeout_sec}s (usually a hanging extension compile)")
         return 0, 0.0
 
     except FileNotFoundError:
@@ -1321,6 +1345,7 @@ def bench(
             "runner_debug_dir": runner_debug_dir,
         })
         print("[CudaForge bench] runner_not_found:", runner, "log:", log_path)
+        _note_fail("runner_not_found", str(runner))
         return 0, 0.0
 
     except Exception as ex:
@@ -1335,11 +1360,15 @@ def bench(
             "runner_debug_dir": runner_debug_dir,
         })
         print("[CudaForge bench] bench_exception (see jsonl log):", log_path)
+        _note_fail("bench_exception", repr(ex))
         return 0, 0.0
 
     if not res or not res.get("ok", False):
+        _note_fail((res or {}).get("kind") or "runner_failed",
+                   (res or {}).get("message") or (res or {}).get("stderr_tail") or "")
         return 0, 0.0
     if not res.get("correct", False):
+        _note_fail(res.get("kind") or "correctness_error", res.get("message") or "")
         return 0, 0.0
 
     speedup = float(res.get("speedup", 0.0))
@@ -1360,7 +1389,8 @@ def bench(
 # Final Reward (bench + rubric shaping)
 # ============================================================
 
-def _emit_attribution(data_source, extra_info, correctness, speedup, reward):
+def _emit_attribution(data_source, extra_info, correctness, speedup, reward,
+                      fail_kind=None, fail_msg=None):
     """The controller's ONLY channel for per-instance and per-category signals.
 
     cudascaffold does not read this function's return value — it scrapes this line out of the
@@ -1375,9 +1405,16 @@ def _emit_attribution(data_source, extra_info, correctness, speedup, reward):
     reports correctness 1 with reward 0.
     """
     ei = extra_info or {}
-    print(f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
-          f"task_name:{ei.get('task_name')}, level:{ei.get('level')}, "
-          f"category:{ei.get('category')}, reward:{reward}")
+    line = (f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
+            f"task_name:{ei.get('task_name')}, level:{ei.get('level')}, "
+            f"category:{ei.get('category')}, reward:{reward}")
+    # `fail:` / `err:` ride at the END so REWARD_LINE's existing groups are untouched; the
+    # controller reads them with a separate tail regex. One flattened line, bounded length —
+    # this is the Teacher's only view of WHY a candidate scored 0.
+    if fail_kind:
+        msg = " ".join(str(fail_msg or "").split())[:160]
+        line += f", fail:{fail_kind}" + (f", err:{msg}" if msg else "")
+    print(line)
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
@@ -1391,15 +1428,23 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     if extra_info is None or "answer" not in extra_info:
         # Attributed like every other outcome. Returning silently here made these candidates
         # invisible to the Teacher: the controller learns what happened only from this line.
-        _emit_attribution(data_source, extra_info, 0, 0.0, 0.0)
+        _emit_attribution(data_source, extra_info, 0, 0.0, 0.0,
+                          fail_kind="no_reference",
+                          fail_msg="extra_info carries no reference answer to check against")
         return 0.0
 
     reference_code = extra_info["answer"]
 
-    correctness, speedup = bench(solution_str, reference_code)
+    bench_detail = {}
+    ei = extra_info or {}
+    correctness, speedup = bench(
+        solution_str, reference_code, detail_out=bench_detail,
+        attribution={k: ei.get(k) for k in ("task_name", "category", "level")})
 
     if correctness != 1:
-        _emit_attribution(data_source, extra_info, correctness, speedup, 0.0)
+        _emit_attribution(data_source, extra_info, correctness, speedup, 0.0,
+                          fail_kind=bench_detail.get("fail_kind") or "incorrect",
+                          fail_msg=bench_detail.get("fail_msg"))
         return 0.0
 
     # extract candidate code for judge
@@ -1439,5 +1484,10 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     # Printing it before the gate meant a kernel zeroed for major_hacking was reported to the
     # Teacher as a success with a positive speedup — correct and fast on the record, worth
     # nothing in the gradient — and the Teacher would credit the text that produced it.
-    _emit_attribution(data_source, extra_info, correctness, speedup, final)
+    fail_kind = fail_msg = None
+    if final == 0.0 and dbg.get("gate") == "major_hacking":
+        fail_kind = "major_hacking"
+        fail_msg = "rubric judge flagged reward hacking; correct and timed but reward zeroed"
+    _emit_attribution(data_source, extra_info, correctness, speedup, final,
+                      fail_kind=fail_kind, fail_msg=fail_msg)
     return final
