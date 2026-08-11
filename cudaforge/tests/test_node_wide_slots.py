@@ -252,3 +252,32 @@ def test_the_log_can_tell_queued_from_spawned(monkeypatch, tmp_path):
     got = phases()
     assert got[-1] == "finish", f"a failed score must record why, got {got}"
     assert got.count("spawned") == 2, "every attempt that reaches a slot must say so"
+
+
+def test_a_multi_gpu_pool_pins_each_holder_to_one_card(tmp_path):
+    """Three gpus x cap 2 = six concurrent, and every acquire names the card it granted."""
+    import importlib.util
+    os.environ["CUDAFORGE_MAX_CONCURRENT_RUNNERS"] = "2"
+    os.environ["CUDAFORGE_SLOT_DIR"] = str(tmp_path / "slots")
+    os.environ["CUDAFORGE_MAX_D_STATE"] = "100000"
+    os.environ["REWARD_CUDA_VISIBLE_DEVICES"] = "4,5,6"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "rbr_multi", os.path.join(CUDAFORGE, "reward_bench_rubric.py"))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        import contextlib as _ctx
+        held, gpus = [], set()
+        with _ctx.ExitStack() as stack:
+            for _ in range(6):
+                fd, gpu = stack.enter_context(m._RUNNER_SLOTS.acquire(timeout=5))
+                held.append(fd)
+                gpus.add(gpu)
+            assert gpus == {"4", "5", "6"}, f"pool did not span every card: {gpus}"
+            with pytest.raises(RuntimeError, match="no kernel_runner slot"):
+                with m._RUNNER_SLOTS.acquire(timeout=0.3):
+                    pass
+    finally:
+        for k in ("CUDAFORGE_MAX_CONCURRENT_RUNNERS", "CUDAFORGE_SLOT_DIR",
+                  "CUDAFORGE_MAX_D_STATE", "REWARD_CUDA_VISIBLE_DEVICES"):
+            os.environ.pop(k, None)

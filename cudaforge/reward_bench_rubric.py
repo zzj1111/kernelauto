@@ -85,10 +85,25 @@ def _abort_if_node_is_wedging():
 
 
 class _NodeSlots:
-    """A counting semaphore shared by every process on this node, backed by flock."""
+    """A counting semaphore shared by every process on this node, backed by flock.
 
-    def __init__(self, n, directory):
+    With several reward GPUs (REWARD_CUDA_VISIBLE_DEVICES="4,5,6") the pool is PER GPU: n
+    slots for each gpu, and acquire() hands back which gpu the slot belongs to, so the runner
+    subprocess is pinned to exactly one card. The cap therefore keeps its original meaning —
+    concurrent runners per GPU, the thing that wedges a driver — while total throughput
+    scales with the card count. A single gpu (or none set) degenerates to the old behavior.
+    """
+
+    def __init__(self, n, directory, gpus=None):
         self.n, self.dir = max(1, int(n)), directory
+        self.gpus = [g for g in (gpus or []) if g] or [None]
+
+    def _units(self):
+        # gpu-major interleave + random rotation: under load slots spread across cards
+        # instead of every scanner piling onto the first gpu's pool.
+        units = [(g, i) for i in range(self.n) for g in self.gpus]
+        start = int.from_bytes(os.urandom(2), "big") % len(units)
+        return units[start:] + units[:start]
 
     @contextlib.contextmanager
     def acquire(self, timeout=None):
@@ -98,14 +113,15 @@ class _NodeSlots:
         _abort_if_node_is_wedging()
         os.makedirs(self.dir, exist_ok=True)
         deadline = None if timeout is None else time.time() + timeout
-        fd = None
+        fd = gpu = None
         try:
             while fd is None:
-                for i in range(self.n):
-                    f = open(os.path.join(self.dir, f"slot_{i:03d}"), "a+")
+                for g, i in self._units():
+                    name = f"slot_{i:03d}" if g is None else f"slot_g{g}_{i:03d}"
+                    f = open(os.path.join(self.dir, name), "a+")
                     try:
                         fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        fd = f
+                        fd, gpu = f, g
                         break
                     except OSError:
                         f.close()
@@ -118,19 +134,22 @@ class _NodeSlots:
                         # node becomes a rebooted one. Fail loudly instead: the trainer surfaces
                         # it, the run stops, and the machine is left recoverable.
                         raise RuntimeError(
-                            f"no kernel_runner slot in {timeout}s: all {self.n} slots in "
+                            f"no kernel_runner slot in {timeout}s: all "
+                            f"{self.n * len(self.gpus)} slots in "
                             f"{self.dir} are held and none are being released. The usual cause is "
                             f"scorers stuck in D state on a wedged GPU driver — check "
                             f"`ps -eo state= | grep -c D` before restarting, and do not raise the "
                             f"cap to work around this.")
                     time.sleep(_SLOT_WAIT_S)
-            yield fd
+            yield fd, gpu
         finally:
             if fd is not None:
                 fd.close()          # releases the flock
 
 
-_RUNNER_SLOTS = _NodeSlots(_MAX_CONCURRENT, _SLOT_DIR)
+_REWARD_GPUS = [g.strip() for g in
+                os.environ.get("REWARD_CUDA_VISIBLE_DEVICES", "").split(",") if g.strip()]
+_RUNNER_SLOTS = _NodeSlots(_MAX_CONCURRENT, _SLOT_DIR, _REWARD_GPUS)
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -1263,14 +1282,18 @@ def bench(
     try:
       # Node-wide slot, not a per-process counter: verl runs this module in
       # reward_model.num_workers separate actors. See _NodeSlots.
-      with _RUNNER_SLOTS.acquire(timeout=_SLOT_TIMEOUT_S):
+      with _RUNNER_SLOTS.acquire(timeout=_SLOT_TIMEOUT_S) as (_slot, _slot_gpu):
+        if _slot_gpu is not None:
+            # The slot names the card. Overrides the whole-list value set earlier so a
+            # 3-gpu pool actually uses 3 gpus instead of device 0 of the list three times.
+            env["CUDA_VISIBLE_DEVICES"] = _slot_gpu
         # Records the moment a slot is held, which is the moment a child becomes possible.
         # Without it, a call that logged `start` and nothing else is ambiguous between two very
         # different states: still queued for a slot (harmless — no process exists), or spawned
         # and then abandoned (an orphaned runner holding a CUDA context, which is the shape that
         # deadlocked the driver). The 2026-08-10 A/B left 429 such calls and the logs could not
         # tell which they were.
-        _log({"phase": "spawned"})
+        _log({"phase": "spawned", "gpu": _slot_gpu})
         p = subprocess.run(
             cmd,
             input=(json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"),

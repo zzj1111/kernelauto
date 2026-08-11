@@ -41,7 +41,8 @@ import sys
 import time
 
 D_LIMIT = 40           # sustained D-state processes that mean the driver is wedging
-RUNNER_LIMIT = 16      # the flock slot pool caps at 12; above this the cap is broken
+RUNNERS_PER_GPU = 12   # the flock slot pool caps at 12 PER reward gpu
+RUNNER_MARGIN = 4      # transient overshoot allowance before we call the cap broken
 RELAUNCH_WINDOW = 1800
 RELAUNCH_MAX = 3
 DISK_MIN_FREE_GB = 25
@@ -97,6 +98,8 @@ def build_cfg():
         # prune threshold is derived from it: a literal was step-units-vs-save-periods wrong
         # and deleted the N-1 checkpoint retention deliberately keeps.
         "save_period": int(env.get("ARM_K") or 10),
+        "n_reward_gpus": max(1, len([g for g in
+                                     (env.get("ARM_REWARD_GPU") or "").split(",") if g.strip()])),
         "judge_gpu": a.judge_gpu, "judge_port": a.judge_port,
         "judge_model": a.judge_model or env.get("JUDGE_MODEL"),
         "judge_gpu_mem": env.get("JUDGE_GPU_MEM") or "0.40",
@@ -257,8 +260,10 @@ def main():
             # Independent conditions, deliberately NOT chained: runaway runner concurrency is
             # a listed CAUSE of D-state pileup, so the cycle where both fire is exactly the
             # one where the forensic log must show both lines.
-            if runners > RUNNER_LIMIT:
-                log(f"RUNNER CAP BROKEN: {runners} concurrent kernel_runner (pool caps at 12)")
+            runner_limit = RUNNERS_PER_GPU * CFG["n_reward_gpus"] + RUNNER_MARGIN
+            if runners > runner_limit:
+                log(f"RUNNER CAP BROKEN: {runners} concurrent kernel_runner "
+                    f"(cap {RUNNERS_PER_GPU} x {CFG['n_reward_gpus']} gpus)")
             if _d_high_streak >= 2:
                 log(f"D-STATE PILEUP: {d} twice running — stopping training to protect the node")
                 stop_training(f"d_state={d}")

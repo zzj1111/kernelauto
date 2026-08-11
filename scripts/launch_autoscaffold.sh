@@ -17,7 +17,8 @@ Placement / hardware
   --gpus LIST               training GPUs                         (env ARM_GPUS,        default 0,1)
   --n-gpus N                 how many of --gpus verl trains on      (env ARM_N_GPUS,      default 2)
   --tp N                     rollout tensor-parallel size           (env ARM_TP,          default 2)
-  --reward-gpu ID            GPU for the kernel benchmark subprocess (env ARM_REWARD_GPU,  default 3)
+  --reward-gpu LIST          GPU(s) for the kernel benchmarks, e.g. 4 or 4,5,6 — the runner
+                              pool keeps 12 concurrent per gpu   (env ARM_REWARD_GPU,  default 3)
   --arch-list LIST           TORCH_CUDA_ARCH_LIST override           (env ARM_TORCH_CUDA_ARCH_LIST, default: auto-detect
                               from the driver — H100/H200=9.0, B200=10.0. Only set this for cross-compiling.)
 
