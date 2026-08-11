@@ -6,7 +6,8 @@
 # 3.4.0 already target Blackwell (sm_100), so the same set is expected to work on B200.
 #
 # Nothing is hardcoded to a user or machine:
-#   VENV_DIR          where to create the venv        (default: <repo>/.venv)
+#   VENV_DIR          where to create the venv        (default: ~/kernel — the directory
+#                                                      name IS the env name uv shows on activate)
 #   UV_CACHE_DIR      uv's wheel cache                (uv default: ~/.cache/uv; point at a big
 #                                                      disk when the root filesystem is small)
 #   FLASH_ATTN_WHEEL  local flash-attn wheel to install (skips the wget below)
@@ -17,7 +18,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
+VENV_DIR="${VENV_DIR:-$HOME/kernel}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 FLASH_ATTN_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"
 LOCK="$REPO_ROOT/requirements-b200-freeze.txt"

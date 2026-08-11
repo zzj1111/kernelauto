@@ -17,7 +17,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$(command -v python3.12 || command -v python3)}"
-VENV_DIR="${VENV_DIR:-$REPO_ROOT/.venv}"
+VENV_DIR="${VENV_DIR:-$HOME/kernel}"
 TORCH_INDEX="${TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 
 if [ -z "${ARM_CUDA_HOME:-}" ]; then

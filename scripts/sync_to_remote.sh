@@ -72,6 +72,6 @@ fi
 
 echo
 echo "Next, ON THE REMOTE:"
-echo "  bash $REMOTE_ROOT/repo/scripts/setup_b200_env.sh"
-echo "  ARM_PYTHON=$REMOTE_ROOT/repo/.venv/bin/python ARM_MODEL=$REMOTE_ROOT/models/<base> \\"
+echo "  bash $REMOTE_ROOT/repo/scripts/setup_b200_uv.sh   # builds ~/kernel"
+echo "  ARM_PYTHON=\$HOME/kernel/bin/python ARM_MODEL=$REMOTE_ROOT/models/<base> \\"
 echo "    JUDGE_MODEL=$REMOTE_ROOT/models/<judge> bash $REMOTE_ROOT/repo/scripts/b200_preflight.sh"
