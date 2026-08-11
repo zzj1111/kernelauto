@@ -44,7 +44,7 @@ declare -A MAP=(
 ORDER=(ARM_ROOT ARM_PYTHON ARM_CUDA_HOME ARM_DOMAIN ARM_MODEL JUDGE_MODEL JUDGE_GPU
        ARM_EXP ARM_EXP_ROOT ARM_CKPT_ROOT ARM_TARGET_STEP ARM_VAL_N ARM_GPUS ARM_N_GPUS
        ARM_TP ARM_REWARD_GPU ARM_TRAIN_FILE ARM_VAL_FILE AUTOSCAFFOLD_OPENAI_KEY_FILE
-       OPENAI_API_KEY ARM_WANDB ARM_GPU_DESC JUDGE_GPU_MEM)
+       OPENAI_API_KEY WANDB_API_KEY ARM_WANDB ARM_GPU_DESC JUDGE_GPU_MEM)
 
 declare -A OVERRIDE=()
 while [[ $# -gt 0 ]]; do
@@ -80,6 +80,7 @@ for k in "${!OVERRIDE[@]}"; do CUR[$k]="${OVERRIDE[$k]}"; done
 # it is captured here into the saved config so watchdog relaunches inherit it, and the teacher
 # reads the env var FIRST (before any key file). A freshly exported key replaces a saved one.
 if [ -n "${OPENAI_API_KEY:-}" ]; then CUR[OPENAI_API_KEY]="$OPENAI_API_KEY"; fi
+if [ -n "${WANDB_API_KEY:-}" ]; then CUR[WANDB_API_KEY]="$WANDB_API_KEY"; fi
 
 # first-run defaults, only where nothing is saved and no flag was given
 : "${CUR[ARM_ROOT]:=$REPO_ROOT}"
@@ -111,7 +112,8 @@ fi
 } > "$CONFIG"
 chmod 600 "$CONFIG"          # may hold the API key
 echo "=== settings saved to $CONFIG ==="
-grep -v "^#" "$CONFIG" | sed "s/\(OPENAI_API_KEY=\).\{6\}.*/\1******/"
+grep -v "^#" "$CONFIG" | sed -e "s/\(OPENAI_API_KEY=\).\{6\}.*/\1******/" \
+                              -e "s/\(WANDB_API_KEY=\).\{6\}.*/\1******/"
 [ "$SAVE_ONLY" = 1 ] && exit 0
 
 # ---- launch ---------------------------------------------------------------------------------

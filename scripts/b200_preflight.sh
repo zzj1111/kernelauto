@@ -74,6 +74,13 @@ if [ -n "${JUDGE_MODEL:-}" ] && [ -e "${JUDGE_MODEL:-}" ]; then pass "judge mode
 else fail "JUDGE_MODEL unset — e.g. hf download Qwen/Qwen3-8B (public), then scripts/serve_rubric_judge.sh"
 fi
 
+echo "== wandb (logger is ON by default; ARM_WANDB=0 disables) =="
+if [ -n "${WANDB_API_KEY:-}" ] || [ -f "$HOME/.netrc" ]; then
+  pass "wandb credentials found — runs log ONLINE to entity mhong-university-of-minnesota (override: WANDB_ENTITY)"
+else
+  echo "  WARN no WANDB_API_KEY and no ~/.netrc — runs fall back to offline; export WANDB_API_KEY for online"
+fi
+
 echo "== Teacher =="
 if [ -n "${OPENAI_API_KEY:-}" ] || { [ -n "${AUTOSCAFFOLD_OPENAI_KEY_FILE:-}" ] && [ -f "$AUTOSCAFFOLD_OPENAI_KEY_FILE" ]; }; then
   pass "OpenAI credentials reachable (never put the key on a command line)"

@@ -100,9 +100,18 @@ def base_env(cfg):
     env["RUBRIC_VLLM_URL"] = cfg["rubric_url"]
     env["RUBRIC_MODEL_NAME"] = cfg["rubric_model"]
     env["RUBRIC_VLLM_TIMEOUT_SEC"] = str(cfg.get("rubric_timeout", 120))
-    if os.environ.get("ARM_WANDB") == "1":
-        env["WANDB_MODE"] = os.environ.get("WANDB_MODE", "offline")
+    if os.environ.get("ARM_WANDB") != "0":
+        has_cred = bool(os.environ.get("WANDB_API_KEY")) or \
+            os.path.exists(os.path.expanduser("~/.netrc"))
+        mode = os.environ.get("WANDB_MODE") or ("online" if has_cred else "offline")
+        if mode == "online" and not has_cred:
+            print("[autoscaffold] WANDB_MODE=online requested but no WANDB_API_KEY/.netrc — "
+                  "falling back to offline (upload later with wandb sync)")
+            mode = "offline"
+        env["WANDB_MODE"] = mode
         env.setdefault("WANDB_DIR", cfg["log_dir"])
+        env.setdefault("WANDB_ENTITY", os.environ.get("WANDB_ENTITY",
+                                                      "mhong-university-of-minnesota"))
     env["RAY_DEDUP_LOGS"] = "0"
     env["HYDRA_FULL_ERROR"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
@@ -304,11 +313,11 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=-1):
         f"trainer.test_freq={test_freq}",
         f"trainer.total_training_steps={to_step}",
         "trainer.resume_mode=auto",
-        # ARM_WANDB=1 adds the wandb logger. WANDB_MODE defaults to offline: training boxes
-        # rarely have (or want) egress mid-run; upload later with
-        #   wandb sync -e mhong-university-of-minnesota <run dir>
-        ("trainer.logger='[\"console\",\"wandb\"]'"
-         if os.environ.get("ARM_WANDB") == "1" else "trainer.logger='[\"console\"]'"),
+        # wandb is ON by default (ARM_WANDB=0 disables). Mode is decided in base_env: online
+        # when credentials exist, offline fallback (with a loud note) when they do not — a
+        # run must not die for telemetry.
+        ("trainer.logger='[\"console\"]'"
+         if os.environ.get("ARM_WANDB") == "0" else "trainer.logger='[\"console\",\"wandb\"]'"),
         f"trainer.project_name={cfg['project']}",
         f"trainer.experiment_name={cfg['exp']}",
         f"trainer.total_epochs={cfg['total_epochs']}",
