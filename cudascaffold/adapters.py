@@ -181,7 +181,14 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=999999):
         #
         # The manager path is the one kept, because the controller's per-category and
         # per-instance signals are scraped from the line compute_score prints under it.
-        "reward_model.use_reward_loop=False",
+        # NOT disabled. An earlier commit turned this off believing the reward manager was a
+        # duplicate path; it is not — with reward_model.reward_manager=dapo the manager crashes
+        # on its first item (dapo.py:120 reads self.overlong_buffer_cfg.enable, which defaults
+        # to None), so the reward loop is the ONLY path that scores anything here. Turning it
+        # off produced "Error in reward_fn: 'NoneType' object has no attribute 'enable'" and no
+        # checkpoint. The duplication that motivated the change is real but has another cause,
+        # still being traced.
+        # "reward_model.use_reward_loop=False",
         f"data.max_prompt_length={cfg['max_prompt_length']}",
         f"data.max_response_length={cfg['max_response_length']}",
         f"actor_rollout_ref.model.path={cfg['model']}",
@@ -440,6 +447,42 @@ REWARD_LINE = re.compile(
     r"(?:,\s*reward:([0-9.eE+-]+))?")
 
 
+def _one_path_per_file(paths):
+    """Collapse paths that are the same file on disk, keeping the real one.
+
+    Ray leaves a `session_latest` SYMLINK beside the real `session_<timestamp>` directory, and
+    both match `session_*`. Globbing therefore returns every worker log twice, and reading both
+    counted every reward line twice: the 2026-08-10 A/B reported n around 400 per arm for 180
+    problems. Nothing was scored twice — only counted twice — but the gate's sample size is what
+    a margin would be computed from, so a doubled n makes the acceptance bar too easy by about
+    sqrt(2).
+
+    Identity is (device, inode), which also collapses hard links, not just the symlink Ray
+    happens to create today.
+    """
+    seen, keep = {}, []
+    for p in sorted(paths):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        prev = seen.get(key)
+        # Prefer the path that is not reached through a symlink, so offsets recorded before and
+        # after a snapshot use the same name for the same bytes.
+        if prev is None or (os.path.realpath(p) == p and os.path.realpath(prev) != prev):
+            seen[key] = p
+    return sorted(seen.values())
+
+
+def _worker_logs(ray_tmp, _pattern=None):
+    """Every Ray worker stdout under a ray tmp root, each file listed once."""
+    import glob
+    pat = os.path.join(*_pattern) if _pattern else os.path.join(
+        ray_tmp, "ray", "session_*", "logs", "worker-*.out")
+    return _one_path_per_file(glob.glob(pat))
+
+
 def worker_log_offsets(cfg):
     """Byte offset of every Ray worker stdout right now.
 
@@ -449,9 +492,8 @@ def worker_log_offsets(cfg):
     appended after it is what separates that pass's candidates from the training rollouts
     interleaved in the same files.
     """
-    import glob
     out = {_ROOT_KEY: cfg["ray_tmp"]}
-    for f in glob.glob(os.path.join(cfg["ray_tmp"], "ray", "session_*", "logs", "worker-*.out")):
+    for f in _worker_logs(cfg["ray_tmp"]):
         try:
             out[f] = os.path.getsize(f)
         except OSError:
@@ -476,10 +518,11 @@ def _read_since(offsets):
     root = offsets.pop(_ROOT_KEY, None)
     files = set(offsets)
     if root:
-        files.update(glob.glob(os.path.join(root, "ray", "session_*", "logs", "worker-*.out")))
+        files.update(_worker_logs(root))
     else:                                    # older snapshot without a root: fall back
         for d in {os.path.dirname(os.path.dirname(f)) for f in offsets}:
-            files.update(glob.glob(os.path.join(d, "logs", "worker-*.out")))
+            files.update(_worker_logs(os.path.dirname(d), _pattern=(d, "logs", "worker-*.out")))
+    files = _one_path_per_file(files)
     chunks = []
     for f in sorted(files):
         try:

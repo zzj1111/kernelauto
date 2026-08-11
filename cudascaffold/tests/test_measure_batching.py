@@ -117,22 +117,20 @@ def test_hydra_overrides_match_what_the_config_already_defines():
                 f"'{key}' overrides a key this config does not define; it needs a '+' prefix")
 
 
-def test_only_one_reward_path_is_enabled():
-    """Every candidate must be compiled, run and timed exactly once.
+def test_the_reward_loop_is_left_enabled():
+    """It must NOT be disabled, which an earlier commit did on a wrong diagnosis.
 
-    This verl has two reward paths, both wired to the same compute_score: the agent loop scores
-    each rollout as it finishes (agent_loop.py:557-578, gated on reward_model.use_reward_loop,
-    which the generated config defaults to true), and the reward manager scores the batch again.
-    Measured on the 2026-08-10 A/B: 540 rows produced 1084 bench() invocations.
+    The reasoning then was that two paths both scored every candidate. They do not: with
+    reward_model.reward_manager=dapo the manager crashes on its first item — dapo.py:120 reads
+    self.overlong_buffer_cfg.enable and that kwarg defaults to None — so the reward loop is the
+    only path that scores anything here. Disabling it produced "Error in reward_fn: 'NoneType'
+    object has no attribute 'enable'" and no checkpoint at all.
 
-    The cost is the smaller half of it. Each invocation forks a runner that creates a CUDA
-    context, and context creation is what deadlocked the driver — so the duplicate path doubled
-    exactly the load that took the node down, and doubled the gate's n while it was at it.
+    The duplication that motivated the change was real but was in the LOG READER, not in
+    scoring: Ray's session_latest symlink made every worker log get globbed twice. See
+    test_a_worker_log_reached_by_two_paths_is_read_once.
     """
     from cudascaffold import adapters as A
-    # The full key set _train_cmd needs. Spelled out rather than skipped on KeyError: a test
-    # that skips itself when the signature drifts protects nothing, and this one guards a defect
-    # that cost a node.
     cfg = {"train_batch_size": 8, "max_prompt_length": 2048, "max_response_length": 8192,
            "model": "/m", "lora_rank": 128, "lora_alpha": 128, "lr": 1e-6, "kl": 0.03,
            "kl_loss_coef": 0.03, "val_file": "/v.parquet", "ckpt_root": "/c", "exp": "e",
@@ -140,17 +138,44 @@ def test_only_one_reward_path_is_enabled():
            "ppo_mini_batch_size": 4, "rollout_n": 6, "project": "p", "reward_path": "/r.py",
            "steps_per_cycle": 10, "total_epochs": 20}
     cmd = A._train_cmd(cfg, "/t.parquet", 10)
-    assert "reward_model.use_reward_loop=False" in cmd, (
-        "the rollout-side reward path is enabled again; every kernel would be benchmarked twice")
+    assert "use_reward_loop=False" not in cmd, (
+        "disabling the reward loop leaves no working scorer; the dapo manager cannot run here")
 
 
-def test_the_upstream_default_is_still_the_one_we_are_overriding():
-    """If upstream ever flips this default, the override becomes a no-op worth re-checking
-    rather than a silent redundancy."""
-    import yaml
-    cfg_path = os.path.join(REPO, "verl", "trainer", "config", "_generated_ppo_trainer.yaml")
-    with open(cfg_path) as f:
-        defined = yaml.safe_load(f)
-    assert defined["reward_model"]["use_reward_loop"] is True, (
-        "upstream no longer defaults use_reward_loop to true — re-check whether the override "
-        "is still needed, and whether the manager path is still the one that prints")
+def test_a_worker_log_reached_by_two_paths_is_read_once(tmp_path):
+    """Ray leaves a `session_latest` symlink beside the real `session_<timestamp>` directory,
+    and both match `session_*`. Globbing therefore returned every worker log twice and counted
+    every reward line twice: the 2026-08-10 A/B reported n near 400 per arm for 180 problems.
+
+    Nothing was scored twice — only counted twice — but n is what an acceptance margin would be
+    computed from, so a doubled n makes the bar too easy by about sqrt(2). Measured on that run's
+    logs: 1200 arm-tagged reward lines before, 600 after.
+    """
+    from cudascaffold import adapters as A
+    real = tmp_path / "ray" / "session_2026-01-01_00-00-00" / "logs"
+    real.mkdir(parents=True)
+    (real / "worker-abc.out").write_text(
+        "correctness: 1, speedup: 2.0, data_source:X, task_name:t@@bare, level:0, "
+        "category:conv@@bare, reward:1.0\n")
+    (tmp_path / "ray" / "session_latest").symlink_to(real.parent)
+
+    raw = __import__("glob").glob(
+        str(tmp_path / "ray" / "session_*" / "logs" / "worker-*.out"))
+    assert len(raw) == 2, "the fixture must reproduce the two-paths situation"
+    assert len(A._worker_logs(str(tmp_path))) == 1, "the same file was listed twice"
+
+    text = A._read_since({A._ROOT_KEY: str(tmp_path)})
+    assert len(A.REWARD_LINE.findall(text)) == 1, (
+        "the reward line was read twice; the gate's n would be double the real sample")
+
+
+def test_dedup_prefers_the_real_path_over_the_symlink(tmp_path):
+    """Offsets are keyed by path, so the name must be stable across snapshots — otherwise a
+    pass reads from byte 0 again and re-counts everything it already counted."""
+    from cudascaffold import adapters as A
+    real = tmp_path / "ray" / "session_2026-01-01_00-00-00" / "logs"
+    real.mkdir(parents=True)
+    (real / "worker-abc.out").write_text("x\n")
+    (tmp_path / "ray" / "session_latest").symlink_to(real.parent)
+    kept, = A._worker_logs(str(tmp_path))
+    assert "session_latest" not in kept, f"kept the symlink path: {kept}"
