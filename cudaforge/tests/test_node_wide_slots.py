@@ -203,3 +203,52 @@ def test_the_check_is_before_the_slot_not_after(monkeypatch, tmp_path):
     body = src[src.index("    def acquire(self, timeout=None):"):]
     assert body.index("_abort_if_node_is_wedging()") < body.index("fcntl.flock"), \
         "the watchdog fires after a slot is taken, which is one context too late"
+
+
+def test_the_log_can_tell_queued_from_spawned(monkeypatch, tmp_path):
+    """A call that logged only `start` is ambiguous, and that ambiguity blocked an investigation.
+
+    The 2026-08-10 A/B left 429 calls with a start record and nothing else. Two very different
+    states produce that: still queued for a slot, where no child exists and nothing is at risk;
+    or spawned and then abandoned, leaving an orphaned runner holding a CUDA context — the exact
+    shape that deadlocks the driver. `spawned` is written the moment a slot is held, which is the
+    moment a child becomes possible, so the two are now distinguishable after the fact.
+    """
+    import importlib.util, json, subprocess as _sp
+    monkeypatch.setenv("CUDAFORGE_MAX_D_STATE", "100000")
+    monkeypatch.setenv("CUDAFORGE_SLOT_DIR", str(tmp_path / "slots"))
+    monkeypatch.chdir(tmp_path)
+    spec = importlib.util.spec_from_file_location(
+        "rbr", os.path.join(CUDAFORGE, "reward_bench_rubric.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    class _P:
+        returncode = 0
+        stderr = b""
+        stdout = json.dumps({"ok": True, "correct": True, "speedup": 1.0}).encode()
+
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _P())
+    m.bench("class ModelNew: pass", "class Model: pass")
+
+    def phases():
+        return [r.get("phase") for f in
+                __import__("glob").glob(
+                    str(tmp_path / "cudaforge_logs" / "bench" / "*" / "*.jsonl"))
+                for l in open(f) if l.strip() for r in [json.loads(l)]]
+
+    # A SUCCESSFUL score writes start then spawned and stops: `finish` is only written when the
+    # runner failed, or when log_on_success is set. Learning that corrected a misreading of the
+    # 2026-08-10 logs, where 429 calls looked abandoned and were in fact the ones that worked.
+    got = phases()
+    assert got == ["start", "spawned"], f"success path should be start -> spawned, got {got}"
+
+    class _Bad:
+        returncode = 1
+        stderr = b"boom"
+        stdout = b""
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: _Bad())
+    m.bench("class ModelNew: pass", "class Model: pass")
+    got = phases()
+    assert got[-1] == "finish", f"a failed score must record why, got {got}"
+    assert got.count("spawned") == 2, "every attempt that reaches a slot must say so"

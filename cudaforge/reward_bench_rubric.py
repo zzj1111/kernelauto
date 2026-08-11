@@ -1210,6 +1210,13 @@ def bench(
       # Node-wide slot, not a per-process counter: verl runs this module in
       # reward_model.num_workers separate actors. See _NodeSlots.
       with _RUNNER_SLOTS.acquire(timeout=_SLOT_TIMEOUT_S):
+        # Records the moment a slot is held, which is the moment a child becomes possible.
+        # Without it, a call that logged `start` and nothing else is ambiguous between two very
+        # different states: still queued for a slot (harmless — no process exists), or spawned
+        # and then abandoned (an orphaned runner holding a CUDA context, which is the shape that
+        # deadlocked the driver). The 2026-08-10 A/B left 429 such calls and the logs could not
+        # tell which they were.
+        _log({"phase": "spawned"})
         p = subprocess.run(
             cmd,
             input=(json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"),

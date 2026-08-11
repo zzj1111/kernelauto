@@ -31,11 +31,26 @@ def test_the_runner_subprocess_is_inside_the_semaphore(name):
     spawns = [m.start() for m in re.finditer(r"subprocess\.run\(\s*\n\s*cmd,", src)]
     if not spawns:
         pytest.skip(f"{name} spawns no runner subprocess")
+    # Checked on indentation, not on a character window: a fixed-size window breaks the moment
+    # anything is inserted between the `with` and the spawn (adding one log line did exactly
+    # that), and a guard that fails for cosmetic reasons gets deleted rather than fixed.
     for pos in spawns:
-        window = src[max(0, pos - 400):pos]
-        assert "_RUNNER_SLOTS" in window, (
-            f"{name}: a kernel_runner subprocess is spawned without holding _RUNNER_SLOTS. "
-            f"243 unbounded runners took the GPU driver down for the whole node once.")
+        before = src[:pos].splitlines()
+        spawn_indent = len(before[-1]) - len(before[-1].lstrip())
+        enclosing = None
+        for line in reversed(before):
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip())
+            if indent < spawn_indent and line.lstrip().startswith("with "):
+                enclosing = line.strip()
+                break
+            if indent < spawn_indent and line.lstrip().startswith(("def ", "class ")):
+                break
+        assert enclosing and "_RUNNER_SLOTS" in enclosing, (
+            f"{name}: a kernel_runner subprocess is spawned outside a _RUNNER_SLOTS block "
+            f"(nearest enclosing `with` is {enclosing!r}). 243 unbounded runners took the GPU "
+            f"driver down for the whole node once.")
 
 
 def test_both_rewards_share_one_slot_pool():
