@@ -43,7 +43,7 @@ declare -A MAP=(
 ORDER=(ARM_ROOT ARM_PYTHON ARM_CUDA_HOME ARM_DOMAIN ARM_MODEL JUDGE_MODEL JUDGE_GPU
        ARM_EXP ARM_EXP_ROOT ARM_CKPT_ROOT ARM_TARGET_STEP ARM_VAL_N ARM_GPUS ARM_N_GPUS
        ARM_TP ARM_REWARD_GPU ARM_TRAIN_FILE ARM_VAL_FILE AUTOSCAFFOLD_OPENAI_KEY_FILE
-       ARM_GPU_DESC JUDGE_GPU_MEM)
+       OPENAI_API_KEY ARM_GPU_DESC JUDGE_GPU_MEM)
 
 declare -A OVERRIDE=()
 while [[ $# -gt 0 ]]; do
@@ -75,6 +75,11 @@ if [ -f "$CONFIG" ]; then
 fi
 for k in "${!OVERRIDE[@]}"; do CUR[$k]="${OVERRIDE[$k]}"; done
 
+# `export OPENAI_API_KEY=...` in the calling shell is the preferred way to hand over the key:
+# it is captured here into the saved config so watchdog relaunches inherit it, and the teacher
+# reads the env var FIRST (before any key file). A freshly exported key replaces a saved one.
+if [ -n "${OPENAI_API_KEY:-}" ]; then CUR[OPENAI_API_KEY]="$OPENAI_API_KEY"; fi
+
 # first-run defaults, only where nothing is saved and no flag was given
 : "${CUR[ARM_ROOT]:=$REPO_ROOT}"
 [ -x "$HOME/kernel/bin/python" ] && : "${CUR[ARM_PYTHON]:=$HOME/kernel/bin/python}"
@@ -87,6 +92,9 @@ MISSING=()
 for k in ARM_MODEL ARM_EXP ARM_TARGET_STEP ARM_PYTHON; do
   [ -n "${CUR[$k]:-}" ] || MISSING+=("$k")
 done
+if [ -z "${CUR[OPENAI_API_KEY]:-}" ] && [ -z "${CUR[AUTOSCAFFOLD_OPENAI_KEY_FILE]:-}" ]; then
+  MISSING+=("OPENAI_API_KEY(export 即可)或 --openai-key-file")
+fi
 if [ "${#MISSING[@]}" -gt 0 ]; then
   echo "FAIL: no saved value and no flag for: ${MISSING[*]}" >&2
   echo "      first run needs at least: --model --exp --target-step (+ --python if ~/kernel is elsewhere)" >&2
@@ -100,8 +108,9 @@ fi
     [ -n "${CUR[$k]:-}" ] && echo "export $k=${CUR[$k]}"
   done
 } > "$CONFIG"
+chmod 600 "$CONFIG"          # may hold the API key
 echo "=== settings saved to $CONFIG ==="
-grep -v "^#" "$CONFIG"
+grep -v "^#" "$CONFIG" | sed "s/\(OPENAI_API_KEY=\).\{6\}.*/\1******/"
 [ "$SAVE_ONLY" = 1 ] && exit 0
 
 # ---- launch ---------------------------------------------------------------------------------
