@@ -145,10 +145,19 @@ def existing_ckpt_step(cfg):
     return best
 
 
-def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=999999):
+def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=-1):
     """The verl invocation. Derived from experiments/Qwen3-32B_KL003_1e-6_Rubric.sh, with the
     model, GPU count and batch sizes moved into cfg so the arm is one config away from a
-    different size."""
+    different size.
+
+    test_freq defaults to -1, not to a large number. ray_trainer.py:1377-1380 validates when
+    `test_freq > 0 and (is_last_step or step % test_freq == 0)` — a large test_freq only defeats
+    the modulo, and every training pass ends on its last step, so 999999 still ran a full
+    held-out validation at the end of each cycle. Those reward lines land inside the window
+    train_adapter snapshots for the Teacher, which is how 96 training rollouts read as 280:
+    two thirds of the Teacher's per-category signal was the held-out set it is not allowed to
+    see. The eval and A/B passes pass test_freq=1 explicitly and go through val_only, which
+    ray_trainer.py:1128-1133 gates on val_before_train alone — they are unaffected."""
     return " ".join([
         f"{VENV_PY} -m verl.trainer.main_ppo",
         "algorithm.adv_estimator=grpo",
