@@ -214,11 +214,20 @@ def main(n_cycles=20):
         # legacy per-scope string into the one item it always was. Cheap and idempotent, so it
         # runs on every resume rather than being gated on a version check that could go stale.
         state["scaffold"] = S.migrate_items(state["scaffold"], cfg["domain"])
+        A.check_resume_consistency(state.get("step") or 0,
+                                   os.path.join(cfg["ckpt_root"]))
         fns["log"](f"[autoscaffold] RESUME {cfg['exp']} at cycle {state.get('cycle')} "
                    f"step={state['step']} scaffold v{state['scaffold'].get('version')} "
                    f"best={state.get('best')}@{state.get('best_step')}")
     else:
         step0 = A.existing_ckpt_step(cfg)
+        if step0:
+            # No state.json yet the ckpt dir is not empty: either a deliberate continue after
+            # the exp dir was wiped, or an EXP NAME COLLISION over a shared ckpt_root. Loud,
+            # because the second reads as the first until valid_seen makes no sense.
+            fns["log"](f"[autoscaffold] NOTE: no state.json but checkpoints exist at step "
+                       f"{step0} under this exp name — continuing FROM THEM. If this was meant "
+                       f"to be a fresh run, use a new ARM_EXP or point ARM_CKPT_ROOT elsewhere.")
         state = L.new_state(step0=step0, scaffold=S.empty_scaffold(cfg["domain"]))
         state["best_step"] = step0
         prior = _load(cfg["journal_path"], [])

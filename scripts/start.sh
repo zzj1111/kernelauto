@@ -39,11 +39,12 @@ declare -A MAP=(
   [--python]=ARM_PYTHON         [--cuda-home]=ARM_CUDA_HOME   [--root]=ARM_ROOT
   [--openai-key-file]=AUTOSCAFFOLD_OPENAI_KEY_FILE
   [--gpu-desc]=ARM_GPU_DESC     [--judge-gpu-mem]=JUDGE_GPU_MEM
+  [--wandb]=ARM_WANDB
 )
 ORDER=(ARM_ROOT ARM_PYTHON ARM_CUDA_HOME ARM_DOMAIN ARM_MODEL JUDGE_MODEL JUDGE_GPU
        ARM_EXP ARM_EXP_ROOT ARM_CKPT_ROOT ARM_TARGET_STEP ARM_VAL_N ARM_GPUS ARM_N_GPUS
        ARM_TP ARM_REWARD_GPU ARM_TRAIN_FILE ARM_VAL_FILE AUTOSCAFFOLD_OPENAI_KEY_FILE
-       OPENAI_API_KEY ARM_GPU_DESC JUDGE_GPU_MEM)
+       OPENAI_API_KEY ARM_WANDB ARM_GPU_DESC JUDGE_GPU_MEM)
 
 declare -A OVERRIDE=()
 while [[ $# -gt 0 ]]; do
@@ -138,6 +139,10 @@ if [ -n "${JUDGE_GPU:-}" ] && [ -n "${JUDGE_MODEL:-}" ]; then
   echo "judge up on :8210"
 fi
 
+STATE="${ARM_EXP_ROOT}/${ARM_EXP}/state.json"
+if [ -f "$STATE" ]; then
+  echo "NOTE: resuming exp '$ARM_EXP' from $(grep -o '"step": [0-9]*' "$STATE" | head -1 || echo '?') — a fresh run needs a NEW --exp"
+fi
 echo "starting training ($N_CYCLES cycles) -> $BASE/run.log"
 nohup bash "$REPO_ROOT/scripts/launch_autoscaffold.sh" "$N_CYCLES" >> "$BASE/run.log" 2>&1 &
 

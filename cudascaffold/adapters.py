@@ -100,6 +100,9 @@ def base_env(cfg):
     env["RUBRIC_VLLM_URL"] = cfg["rubric_url"]
     env["RUBRIC_MODEL_NAME"] = cfg["rubric_model"]
     env["RUBRIC_VLLM_TIMEOUT_SEC"] = str(cfg.get("rubric_timeout", 120))
+    if os.environ.get("ARM_WANDB") == "1":
+        env["WANDB_MODE"] = os.environ.get("WANDB_MODE", "offline")
+        env.setdefault("WANDB_DIR", cfg["log_dir"])
     env["RAY_DEDUP_LOGS"] = "0"
     env["HYDRA_FULL_ERROR"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
@@ -160,6 +163,39 @@ def ckpt_is_usable(path):
             if not os.path.isfile(os.path.join(actor, f"{kind}_world_size_{ws}_rank_{rank}.pt")):
                 return False
     return True
+
+
+def check_resume_consistency(state_step, ckpt_dir, allow_env="ARM_ALLOW_STATE_CKPT_MISMATCH"):
+    """Refuse to resume when state.json and the checkpoints disagree.
+
+    verl's resume_mode=auto silently starts from BASE weights when default_local_dir holds no
+    usable checkpoint. Combined with a state.json that says step=N, that produces a run whose
+    scaffold, journal and step counter continue from cycle N/2 while the policy restarted from
+    zero — every signal the Teacher reads is then attributed to weights that do not exist.
+    The same shape happens in reverse when an exp name is reused over a ckpt_root holding
+    SOMEONE ELSE'S newer checkpoints. Both are config mistakes; fail loudly at launch instead
+    of surfacing as an inexplicable valid_seen cliff five hours in.
+    """
+    if not state_step:
+        return
+    latest_f = os.path.join(ckpt_dir, "latest_checkpointed_iteration.txt")
+    latest = None
+    if os.path.exists(latest_f):
+        try:
+            latest = int(open(latest_f).read().strip())
+        except ValueError:
+            pass
+    if latest == state_step:
+        return
+    if os.environ.get(allow_env) == "1":
+        print(f"[autoscaffold] WARNING: state step={state_step} vs checkpoint latest={latest} "
+              f"under {ckpt_dir} — proceeding because {allow_env}=1")
+        return
+    raise SystemExit(
+        f"REFUSING TO RESUME: state.json says step={state_step} but {ckpt_dir} has "
+        f"latest={latest}. Continuing would train from the wrong weights while the journal "
+        f"claims otherwise. Fix the ckpt_root/exp mismatch (or set {allow_env}=1 if this "
+        f"divergence is intentional).")
 
 
 def existing_ckpt_step(cfg):
@@ -268,7 +304,11 @@ def _train_cmd(cfg, train_file, to_step, val_before=False, test_freq=-1):
         f"trainer.test_freq={test_freq}",
         f"trainer.total_training_steps={to_step}",
         "trainer.resume_mode=auto",
-        "trainer.logger='[\"console\"]'",
+        # ARM_WANDB=1 adds the wandb logger. WANDB_MODE defaults to offline: training boxes
+        # rarely have (or want) egress mid-run; upload later with
+        #   wandb sync -e mhong-university-of-minnesota <run dir>
+        ("trainer.logger='[\"console\",\"wandb\"]'"
+         if os.environ.get("ARM_WANDB") == "1" else "trainer.logger='[\"console\"]'"),
         f"trainer.project_name={cfg['project']}",
         f"trainer.experiment_name={cfg['exp']}",
         f"trainer.total_epochs={cfg['total_epochs']}",
