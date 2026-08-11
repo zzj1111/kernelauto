@@ -927,7 +927,10 @@ def per_category_from_log(offsets):
     out = {}
     for cat, a in agg.items():
         sp = sorted(a["speedups"])
-        out[cat] = {"n": a["n"], "n_correct": round(a["n_correct"], 3),
+        # n_correct is fractional only when a padding phantom's observations disagreed;
+        # keep the common case printing as the integer it is.
+        nc = round(a["n_correct"], 3)
+        out[cat] = {"n": a["n"], "n_correct": int(nc) if nc == int(nc) else nc,
                     "correct_rate": round(a["n_correct"] / a["n"], 4) if a["n"] else 0.0,
                     "speedup_median": round(sp[len(sp) // 2], 3) if sp else None,
                     "n_faster_than_torch": sum(1 for s in sp if s > 1.0)}
