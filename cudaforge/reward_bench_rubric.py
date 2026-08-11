@@ -1110,13 +1110,25 @@ def bench(
                 record.setdefault(k, v)
         _write_jsonl(log_path, record)
 
+    if not torch_cuda_arch_list and not os.environ.get("TORCH_CUDA_ARCH_LIST"):
+        # Terminal fallback. Loud on purpose: entry paths that bypass cudascaffold's driver
+        # detection (direct verl runs, standalone compute_score) would otherwise compile
+        # sm_90 cubins on any GPU and score a uniform silent 0.0.
+        global _WARNED_ARCH_FALLBACK
+        if not _WARNED_ARCH_FALLBACK:
+            _WARNED_ARCH_FALLBACK = True
+            print("[CudaForge bench] WARNING: no torch_cuda_arch_list and no "
+                  "TORCH_CUDA_ARCH_LIST in env; defaulting to 9.0 (sm_90). On any other "
+                  "GPU every kernel will fail to load and score 0.")
     torch_cuda_arch_list = (torch_cuda_arch_list
                             or os.environ.get("TORCH_CUDA_ARCH_LIST") or "9.0")
 
     def _note_fail(kind, msg=""):
+        # Raw-ish here; the single flatten/truncate/sanitize point is _emit_attribution,
+        # so the jsonl trail and the printed line cannot drift apart on different limits.
         if detail_out is not None:
             detail_out["fail_kind"] = kind
-            detail_out["fail_msg"] = " ".join(str(msg or "").split())[:200]
+            detail_out["fail_msg"] = str(msg or "")[:500]
 
     def _root_cause(r):
         """The runner's message plus the LAST line of its traceback, which is the exception
@@ -1204,6 +1216,13 @@ def bench(
                               f"/dev/shm/torch_ext_cache_reward_cuda{vis}")
         digest = hashlib.sha1((solution_str or "").encode("utf-8", "replace")).hexdigest()[:16]
         ext_dir = os.path.join(root, digest)
+        # Refresh mtime on every USE, not just on build: loading a cached .so never touches
+        # the directory, and the watchdog prunes cache entries idle for an hour — without
+        # this, a repeat of an hour-old candidate races the janitor and scores a false 0.
+        try:
+            os.utime(ext_dir)
+        except OSError:
+            pass
     else:
         ext_dir = f"/dev/shm/torch_ext_{pid}_{ts}"
     env["TORCH_EXTENSIONS_DIR"] = ext_dir
@@ -1400,6 +1419,9 @@ def bench(
 # Final Reward (bench + rubric shaping)
 # ============================================================
 
+_WARNED_ARCH_FALLBACK = False
+
+
 def _emit_attribution(data_source, extra_info, correctness, speedup, reward,
                       fail_kind=None, fail_msg=None):
     """The controller's ONLY channel for per-instance and per-category signals.
@@ -1421,10 +1443,17 @@ def _emit_attribution(data_source, extra_info, correctness, speedup, reward,
             f"category:{ei.get('category')}, reward:{reward}")
     # `fail:` / `err:` ride at the END so REWARD_LINE's existing groups are untouched; the
     # controller reads them with a separate tail regex. One flattened line, bounded length —
-    # this is the Teacher's only view of WHY a candidate scored 0.
+    # this is the Teacher's only view of WHY a candidate scored 0. `err` consumes the rest of
+    # the line on the parse side, so it MUST stay the final field; extend the line BEFORE it.
     if fail_kind:
+        kind = re.sub(r"[\s,]+", "_", str(fail_kind))[:40]
         msg = " ".join(str(fail_msg or "").split())[:160]
-        line += f", fail:{fail_kind}" + (f", err:{msg}" if msg else "")
+        # The message is candidate-controlled text (their own exception), printed into the
+        # stream the controller scans with REWARD_LINE. A crafted exception message shaped
+        # like a reward line would register as a phantom sample with attacker-chosen
+        # category and speedup, so break the one token the scanner anchors on.
+        msg = re.sub(r"correctness\s*:", "correctness=", msg)
+        line += f", fail:{kind}" + (f", err:{msg}" if msg else "")
     print(line)
 
 

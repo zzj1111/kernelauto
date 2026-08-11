@@ -50,16 +50,16 @@ ORPHAN_MIN_AGE_SEC = 1800
 
 
 def parse_env_file(path):
-    """{K: V} from `export K=V` lines. Values may be quoted; $VARS are NOT expanded except
-    via os.path.expandvars against the current environment, which covers $HOME-style usage."""
-    out = {}
-    for ln in open(path):
-        ln = ln.strip()
-        if not ln.startswith("export ") or "=" not in ln:
-            continue
-        k, v = ln[len("export "):].split("=", 1)
-        out[k.strip()] = os.path.expandvars(shlex.split(v)[0] if v else "")
-    return out
+    """{K: V} exactly as the arm will see it: bash sources the file and dumps env.
+
+    A hand-rolled parser diverged from the real thing on the first self-referencing value
+    (`export ARM_CKPT_ROOT=$ARM_ROOT/ckpts` expands against the FILE's earlier lines when
+    sourced, and to empty under naive expandvars) — and a watchdog reading a different
+    ckpt_root than the arm it manages prunes the wrong directory."""
+    dump = subprocess.run(
+        ["bash", "-c", f"set -a; source {shlex.quote(path)} >/dev/null 2>&1; env -0"],
+        capture_output=True, text=True, timeout=30).stdout
+    return dict(kv.split("=", 1) for kv in dump.split("\0") if "=" in kv)
 
 
 def build_cfg():
@@ -82,15 +82,25 @@ def build_cfg():
 
     root = need("ARM_ROOT")
     exp = need("ARM_EXP")
+    # Required, not defaulted: without a target the relaunch condition cannot distinguish
+    # "crashed short of the goal" from "finished cleanly", and a finished run would be
+    # relaunched forever — silently burning GPU hours and Teacher API calls.
+    target = int(need("ARM_TARGET_STEP"))
     base = os.path.dirname(os.path.abspath(a.env_file))
     return {
         "env_file": os.path.abspath(a.env_file), "base": base, "interval": a.interval,
         "root": root, "py": env.get("ARM_PYTHON") or sys.executable, "exp": exp,
         "exp_root": env.get("ARM_EXP_ROOT") or os.path.join(base, "exp"),
         "ckpt_root": env.get("ARM_CKPT_ROOT") or os.path.join(base, "ckpts"),
-        "target": int(env.get("ARM_TARGET_STEP") or 0) or None,
+        "target": target,
+        # verl saves every steps_per_cycle steps (ARM_K, run_arm's default 10). The orphan
+        # prune threshold is derived from it: a literal was step-units-vs-save-periods wrong
+        # and deleted the N-1 checkpoint retention deliberately keeps.
+        "save_period": int(env.get("ARM_K") or 10),
         "judge_gpu": a.judge_gpu, "judge_port": a.judge_port,
         "judge_model": a.judge_model or env.get("JUDGE_MODEL"),
+        "judge_gpu_mem": env.get("JUDGE_GPU_MEM") or "0.40",
+        "judge_max_len": env.get("JUDGE_MAX_MODEL_LEN") or "16384",
         "log": os.path.join(base, "watchdog.log"),
         "halt": os.path.join(base, "HALT"),
         "run_log": os.path.join(base, "run.log"),
@@ -177,7 +187,8 @@ def relaunch_judge():
             [CFG["py"], "-m", "vllm.entrypoints.openai.api_server",
              "--model", CFG["judge_model"], "--served-model-name", "rubric-judge",
              "--host", "127.0.0.1", "--port", str(CFG["judge_port"]),
-             "--gpu-memory-utilization", "0.40", "--max-model-len", "16384",
+             "--gpu-memory-utilization", CFG["judge_gpu_mem"],
+             "--max-model-len", CFG["judge_max_len"],
              "--disable-log-requests"],
             env=env, stdout=out, stderr=out, start_new_session=True)
     log(f"relaunched judge on GPU {CFG['judge_gpu']}")
@@ -212,13 +223,20 @@ def prune_disk():
         latest_f = os.path.join(ck, "latest_checkpointed_iteration.txt")
         if os.path.exists(latest_f):
             latest = int(open(latest_f).read().strip())
+            # Strictly older than the newest TWO completed saves (verl's own retention),
+            # in SAVE-PERIOD units. `latest - 4` hardcoded here once encoded save_freq=2
+            # and deleted the N-1 fallback whenever save_freq was larger.
+            cutoff = latest - 2 * CFG["save_period"]
             for cd in glob.glob(os.path.join(ck, "global_step_*")):
                 n = int(cd.rsplit("_", 1)[-1])
-                if n <= latest - 4 and time.time() - os.path.getmtime(cd) > ORPHAN_MIN_AGE_SEC:
+                if n < cutoff and time.time() - os.path.getmtime(cd) > ORPHAN_MIN_AGE_SEC:
                     shutil.rmtree(cd, ignore_errors=True)
                     log(f"pruned orphan checkpoint global_step_{n} (latest={latest})")
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as e:
+        # Still swallowed so the watchdog survives, but never silently: a malformed latest
+        # pointer aborting THIS function is exactly the kind of quiet failure that let the
+        # disk fill while every cycle logged "ok".
+        log(f"prune_disk error: {e!r}")
 
 
 def main():
@@ -227,20 +245,24 @@ def main():
     while True:
         try:
             d = d_count()
-            runners = sum(1 for _, a in procs() if is_py(a, "kernel_runner.py"))
-            arm_alive = any(is_py(a, "cudascaffold.run_arm") for _, a in procs())
+            snapshot = procs()
+            runners = sum(1 for _, a in snapshot if is_py(a, "kernel_runner.py"))
+            arm_alive = any(is_py(a, "cudascaffold.run_arm") for _, a in snapshot)
             step, tgt = state_step(), CFG["target"]
 
             if d > D_LIMIT:
                 _d_high_streak += 1
             else:
                 _d_high_streak = 0
+            # Independent conditions, deliberately NOT chained: runaway runner concurrency is
+            # a listed CAUSE of D-state pileup, so the cycle where both fire is exactly the
+            # one where the forensic log must show both lines.
+            if runners > RUNNER_LIMIT:
+                log(f"RUNNER CAP BROKEN: {runners} concurrent kernel_runner (pool caps at 12)")
             if _d_high_streak >= 2:
                 log(f"D-STATE PILEUP: {d} twice running — stopping training to protect the node")
                 stop_training(f"d_state={d}")
                 _d_high_streak = 0
-            elif runners > RUNNER_LIMIT:
-                log(f"RUNNER CAP BROKEN: {runners} concurrent kernel_runner (pool caps at 12)")
 
             prune_disk()
 

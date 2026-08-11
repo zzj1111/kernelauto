@@ -382,26 +382,45 @@ def eval_adapter(checkpoint, val_n, cfg):
     step = int(str(checkpoint).rstrip("/").split("global_step_")[-1])
     if val_n > 1 and os.environ.get("ARM_EVAL_SEPARATE_DRAWS", "0") != "1":
         return _eval_merged(checkpoint, step, val_n, cfg)
+    # Row-tag a copy of the val file so verl's padding phantoms collapse in the scrape below,
+    # exactly as _eval_merged and measure_ab_adapter do. Without this the "trustworthy"
+    # per-category numbers carried the same double-count bug the A/B was cured of.
+    import pandas as pd
+    df = pd.read_parquet(cfg["val_file"])
+    rows = []
+    for x in df.extra_info:
+        e = dict(x)
+        if e.get("task_name"):
+            e["task_name"] = f"{e['task_name']}{_ROW_MARK}{len(rows)}"
+        rows.append(e)
+    df["extra_info"] = rows
+    tagged_val = os.path.join(cfg["work"], f"eval_s{step}_tagged.parquet")
+    df.to_parquet(tagged_val, index=False)
+
     draws, pers, pers_n = [], [], []
     for d in range(val_n):
         elog = os.path.join(cfg["log_dir"], f"{cfg['exp']}_eval_s{step}_d{d}.log")
         env = base_env(cfg)
         env["VLLM_SEED"] = str(d)
         off = worker_log_offsets(cfg)
-        cmd = _train_cmd(cfg, cfg["val_file"], step, val_before=True, test_freq=1)
+        cmd = _train_cmd(cfg, tagged_val, step, val_before=True, test_freq=1)
         _run(cmd + " trainer.val_only=True", elog, env)
         sr, per = parse_val(elog)
         # parse_val keys on verl's data_source, and this dataset has ONE of those — a breakdown
         # with one key cannot say which category is weak, so the Teacher was diagnosing
         # categories from the training rollouts alone (n≈12-24) while 180 bare held-out answers
         # sat unread in the worker logs. Scrape those instead; data_source stays the fallback.
+        # A draw only counts when BOTH reads landed: mixing category keys from one draw with
+        # data_source keys from another averages every key against a phantom 0.0 in the
+        # other's draws, halving every number the Teacher sees.
+        if sr is None:
+            continue
         by_cat = per_category_from_log(off)
         if by_cat:
             per = {c: v["correct_rate"] for c, v in by_cat.items()}
             pers_n.append({c: v["n"] for c, v in by_cat.items()})
-        if sr is not None:
-            draws.append(sr)
-            pers.append(per)
+        draws.append(sr)
+        pers.append(per)
     if not draws:
         raise StepFailed(
             f"eval at step {step} parsed no validation reward from any of {val_n} draws; "
@@ -411,7 +430,7 @@ def eval_adapter(checkpoint, val_n, cfg):
     per_task = {k: round(sum(p.get(k, 0.0) for p in pers) / len(pers), 4) for k in keys}
     out = {"avg": avg, "per_task": per_task, "draws": [round(x, 4) for x in draws],
            "n_draws": len(draws), "n_draws_requested": val_n}
-    if pers_n:
+    if len(pers_n) == len(pers) and pers_n:
         out["per_task_n"] = {k: max(p.get(k, 0) for p in pers_n) for k in keys}
         out["per_task_unit"] = ("held-out correct-rate per category, bare prompt; "
                                 "n = candidates scored per draw")
@@ -450,8 +469,10 @@ def _eval_merged(checkpoint, step, val_n, cfg):
             e["category"] = f"{cat}{_ARM_SEP}d{d}"
             # Row id for the same reason measure_ab_adapter stamps one: verl pads validation
             # batches by repeating rows, and an untagged repeat is indistinguishable from the
-            # legitimate copy of the same task in another draw.
-            e["task_name"] = f"{e.get('task_name')}{_ROW_MARK}{len(rows)}{_ARM_SEP}d{d}"
+            # legitimate copy of the same task in another draw. Guarded like measure_ab: a
+            # row with no task_name must not become the literal string "None#r0@@d0".
+            if e.get("task_name"):
+                e["task_name"] = f"{e['task_name']}{_ROW_MARK}{len(rows)}{_ARM_SEP}d{d}"
             rows.append(e)
         df["extra_info"] = rows
         frames.append(df)
@@ -489,10 +510,15 @@ def _eval_merged(checkpoint, step, val_n, cfg):
     avg = round(sum(draws) / len(draws), 4)
     keys = sorted({k for p in pers for k in p})
     per_task = {k: round(sum(p.get(k, 0.0) for p in pers) / len(pers), 4) for k in keys}
+    per_task_n = {k: max((dict(per_draw[t]).get(k, (0, 0))[1] for t in per_draw), default=0)
+                  for k in keys}
     cfg.get("log", lambda *a: None)(
         f"[eval] step {step}: {val_n} draws in ONE pass ({len(draws)} parsed) draws={draws}")
     return {"avg": avg, "per_task": per_task, "draws": draws,
-            "n_draws": len(draws), "n_draws_requested": val_n}
+            "n_draws": len(draws), "n_draws_requested": val_n,
+            "per_task_n": per_task_n,
+            "per_task_unit": ("held-out correct-rate per category, bare prompt; "
+                              "n = candidates scored per draw")}
 
 
 # `category:` is optional so logs written before it was echoed still parse.

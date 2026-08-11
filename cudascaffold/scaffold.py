@@ -17,6 +17,7 @@ Design decisions locked with the user:
 from __future__ import annotations
 
 import copy
+import functools
 import os
 import subprocess
 
@@ -91,6 +92,26 @@ TASK_INFO = {
     "pick_clean_then_place_in_recep": "Find object X, clean it at the sinkbasin, then put it in/on receptacle Y.",
 }
 
+@functools.lru_cache(maxsize=1)
+def _gpu_probe():
+    """(name, compute_cap) of the TRAINING GPU, one cached nvidia-smi call per process.
+
+    Cached because this file's two Domain literals both want it at import, and each driver
+    query costs 100ms healthy and up to the 10s timeout on a busy node. Queries the first
+    GPU the run will actually train on (ARM_GPUS, else CUDA_VISIBLE_DEVICES) rather than
+    slot 0 — on a heterogeneous node the Teacher should be told about the training silicon,
+    not whatever sits in the first PCIe slot. If the driver is wedged (D-state), set
+    ARM_GPU_DESC to skip the subprocess entirely; _gpu_fact honors it before calling here.
+    """
+    first = (os.environ.get("ARM_GPUS") or os.environ.get("CUDA_VISIBLE_DEVICES")
+             or "0").split(",")[0].strip()
+    out = subprocess.run(
+        ["nvidia-smi", "-i", first, "--query-gpu=name,compute_cap", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=10)
+    name, cap = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")[:2]]
+    return name, cap
+
+
 def _gpu_fact(suffix=""):
     """The domain-facts sentence naming the target GPU, detected from the driver.
 
@@ -102,10 +123,7 @@ def _gpu_fact(suffix=""):
     desc = os.environ.get("ARM_GPU_DESC")
     if not desc:
         try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=10)
-            name, cap = [x.strip() for x in out.stdout.strip().splitlines()[0].split(",")[:2]]
+            name, cap = _gpu_probe()
             fam = {"7": "Volta", "8": "Ampere/Ada", "9": "Hopper",
                    "10": "Blackwell", "12": "Blackwell"}.get(cap.split(".")[0], "")
             sm = "sm_" + cap.replace(".", "")

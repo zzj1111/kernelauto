@@ -5,6 +5,14 @@
 set -u
 
 PY="${ARM_PYTHON:-$(command -v python)}"
+# Same discovery as setup_b200_env.sh: newest toolkit with a working nvcc, override wins.
+# A hardcoded 12.9 here failed the documented setup->preflight flow on any box whose setup
+# had just discovered a different toolkit.
+if [ -z "${ARM_CUDA_HOME:-}" ]; then
+  for c in /usr/local/cuda-12.9 $(ls -d /usr/local/cuda-12.* 2>/dev/null | sort -rV); do
+    [ -x "$c/bin/nvcc" ] && ARM_CUDA_HOME="$c" && break
+  done
+fi
 CUDA_HOME="${ARM_CUDA_HOME:-/usr/local/cuda-12.9}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ok=0; bad=0
