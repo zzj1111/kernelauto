@@ -48,6 +48,9 @@ from . import loop as L
 ROOT = os.environ.get("ARM_ROOT", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+_DOM_NAME = os.environ.get("ARM_DOMAIN", "cuda")
+
+
 def default_cfg():
     exp = os.environ.get("ARM_EXP", "cuda_scaffold_8b")
     exp_root = os.environ.get("ARM_EXP_ROOT", "/mnt/data1/zha00175/exp_cudaforge")
@@ -68,11 +71,18 @@ def default_cfg():
         # --- model / data ---
         "model": os.environ.get("ARM_MODEL",
                                 "/mnt/data1/zha00175/models/drkernel-8b-coldstart"),
-        # train_new.parquet is the only dump carrying `level` and `task_name`, which the category
-        # scopes and the group-level injection coin flip both need.
+        # Defaults follow the DOMAIN: the triton domain trained on the CudaForge parquet once
+        # already in a mis-set env, and nothing failed loudly — the categories still parsed,
+        # only every domain fact was about the wrong task. (train_new.parquet is the CudaForge
+        # dump carrying `level` and `task_name`; the Triton split carries both natively.)
         "train_file": os.environ.get("ARM_TRAIN_FILE",
-                                     f"{ROOT}/dataset/CudaForge/train_new.parquet"),
-        "val_file": os.environ.get("ARM_VAL_FILE", f"{ROOT}/dataset/CudaForge/test.parquet"),
+                                     f"{ROOT}/dataset/Triton/train.parquet"
+                                     if _DOM_NAME == "triton"
+                                     else f"{ROOT}/dataset/CudaForge/train_new.parquet"),
+        "val_file": os.environ.get("ARM_VAL_FILE",
+                                   f"{ROOT}/dataset/Triton/test.parquet"
+                                   if _DOM_NAME == "triton"
+                                   else f"{ROOT}/dataset/CudaForge/test.parquet"),
         "reward_path": os.environ.get("ARM_REWARD", f"{ROOT}/cudaforge/reward_bench_rubric.py"),
         # --- optimisation (from experiments/Qwen3-32B_KL003_1e-6_Rubric.sh, scaled to 2 GPUs) ---
         "lora_rank": int(os.environ.get("ARM_LORA_RANK", "128")),
@@ -94,8 +104,7 @@ def default_cfg():
         # Which domain this arm trains. The descriptor decides the scaffold's scopes, what the
         # Teacher is told about the task, and how splice labels a row — hard-coding it meant a
         # second dataset could not be run without editing code.
-        "domain": {"cuda": S.CUDA_DOMAIN, "triton": S.TRITON_DOMAIN}[
-            os.environ.get("ARM_DOMAIN", "cuda")],
+        "domain": {"cuda": S.CUDA_DOMAIN, "triton": S.TRITON_DOMAIN}[_DOM_NAME],
         "teacher_priors": os.environ.get("ARM_PRIORS", "0") == "1",
         # How many cycles the scaffold may stay empty before the pre-check is bypassed. The
         # previous run declined 20/20 and ended having measured nothing about whether text helps.
