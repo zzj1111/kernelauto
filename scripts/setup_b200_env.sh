@@ -35,18 +35,39 @@ echo "repo=$REPO_ROOT venv=$VENV_DIR python=$PYTHON cuda=$ARM_CUDA_HOME"
 PIP="$VENV_DIR/bin/pip"
 "$PIP" install -q --upgrade pip
 
-# Torch first so nothing else drags in a CPU wheel; vllm second because it pins its own triton
-# (3.4.0, which is what compiles the policy's generated kernels — it MUST be Blackwell-capable).
-"$PIP" install "torch==2.8.0" --index-url "$TORCH_INDEX"
-"$PIP" install "vllm==0.11.0" "ray[default]==2.52.1" "transformers==4.56.1"
+# Preferred path: the exact 357-package freeze of the H100 venv that ran the full unattended
+# smoke (requirements-b200-freeze.txt, committed in-repo). Two lines get special handling:
+#   - flash_attn is a file:// wheel reference to a path on the source machine. Installed
+#     separately: FLASH_ATTN_WHEEL can point at a local copy (sync_to_remote can carry it);
+#     unset, we skip it — prebuilt cu12torch2.8 wheels may lack sm_100 kernels anyway, and
+#     sdpa attention is the working fallback until a Blackwell wheel is verified.
+#   - flashinfer-python is stripped on sm_100+ below, so it is never installed from the lock.
+LOCK="$REPO_ROOT/requirements-b200-freeze.txt"
+if [ -f "$LOCK" ]; then
+  echo "installing from exact freeze: $LOCK"
+  FILTERED="$(mktemp)"
+  grep -vE "^(flash_attn|flashinfer-python)" "$LOCK" > "$FILTERED"
+  "$PIP" install -r "$FILTERED" --extra-index-url "$TORCH_INDEX"
+  rm -f "$FILTERED"
+  if [ -n "${FLASH_ATTN_WHEEL:-}" ] && [ -f "${FLASH_ATTN_WHEEL:-}" ]; then
+    "$PIP" install "$FLASH_ATTN_WHEEL"
+  else
+    echo "NOTE: flash_attn not installed (no FLASH_ATTN_WHEEL); preflight will warn."
+  fi
+else
+  # Fallback: top-level pins only, pip resolves the rest.
+  "$PIP" install "torch==2.8.0" --index-url "$TORCH_INDEX"
+  "$PIP" install "vllm==0.11.0" "ray[default]==2.52.1" "transformers==4.56.1"
+  CONSTRAINTS="$(mktemp)"
+  printf 'torch==2.8.0\nvllm==0.11.0\ntriton==3.4.0\n' > "$CONSTRAINTS"
+  "$PIP" install -c "$CONSTRAINTS" openai wandb ninja pytest pyarrow pandas
+  rm -f "$CONSTRAINTS"
+fi
 
-# The verl fork itself. --no-deps after the heavy pins are in place would skip needed extras,
-# so let pip resolve but keep torch pinned: constraint file wins over transitive requirements.
-CONSTRAINTS="$(mktemp)"
-printf 'torch==2.8.0\nvllm==0.11.0\ntriton==3.4.0\n' > "$CONSTRAINTS"
-"$PIP" install -e "$REPO_ROOT" -c "$CONSTRAINTS"
-"$PIP" install -c "$CONSTRAINTS" openai wandb ninja pytest pyarrow pandas
-rm -f "$CONSTRAINTS"
+# The verl fork itself, on top of the pinned set. NOTE the distribution is named "verl" — the
+# same name verl-agent uses — which is WHY this venv must not be shared with an ALFWorld env:
+# whichever repo installs last silently replaces the other's trainer.
+"$PIP" install -e "$REPO_ROOT" --no-deps
 
 # flashinfer's prebuilt wheels broke vLLM on sm_100 during the ALFWorld B200 move; vLLM falls
 # back to its own kernels without it. Only strip it where the failure exists.

@@ -47,6 +47,9 @@ for mod, why in [("torch", "training"), ("vllm", "rollouts and the judge"),
 import torch
 print(f"  OK   torch {torch.__version__} cuda={torch.version.cuda} "
       f"devices={torch.cuda.device_count()}")
+if importlib.util.find_spec("flash_attn") is None:
+    print("  WARN flash_attn not installed — verl FSDP training needs attention=sdpa, "
+          "or pass FLASH_ATTN_WHEEL to setup_b200_env.sh")
 if importlib.util.find_spec("flashinfer") is not None:
     cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
     if cap >= (10, 0):
