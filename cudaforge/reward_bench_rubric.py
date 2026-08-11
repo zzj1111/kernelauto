@@ -1118,6 +1118,18 @@ def bench(
             detail_out["fail_kind"] = kind
             detail_out["fail_msg"] = " ".join(str(msg or "").split())[:200]
 
+    def _root_cause(r):
+        """The runner's message plus the LAST line of its traceback, which is the exception
+        itself. "Runtime failure during forward/benchmark." names a stage; "RuntimeError: CUDA
+        error: an illegal memory access was encountered" names a bug — the Teacher can only
+        write text against the second."""
+        msg = (r or {}).get("message") or ""
+        tb = (r or {}).get("log") or ""
+        last = next((ln.strip() for ln in reversed(tb.splitlines()) if ln.strip()), "")
+        if last and last not in msg:
+            msg = f"{msg} :: {last}" if msg else last
+        return msg or (r or {}).get("stderr_tail") or ""
+
     # 1) extract candidate code
     try:
         test_code = _extract_python_code(solution_str)
@@ -1364,11 +1376,10 @@ def bench(
         return 0, 0.0
 
     if not res or not res.get("ok", False):
-        _note_fail((res or {}).get("kind") or "runner_failed",
-                   (res or {}).get("message") or (res or {}).get("stderr_tail") or "")
+        _note_fail((res or {}).get("kind") or "runner_failed", _root_cause(res))
         return 0, 0.0
     if not res.get("correct", False):
-        _note_fail(res.get("kind") or "correctness_error", res.get("message") or "")
+        _note_fail(res.get("kind") or "correctness_error", _root_cause(res))
         return 0, 0.0
 
     speedup = float(res.get("speedup", 0.0))
