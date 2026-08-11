@@ -37,7 +37,34 @@ VENV_PY = os.environ.get("ARM_PYTHON") or (
 #   - torch looks for the ninja EXECUTABLE on PATH, so the venv's bin must be on it.
 CUDA_HOME = os.environ.get("ARM_CUDA_HOME", "/usr/local/cuda-12.9")
 CUDA_BIN = os.environ.get("ARM_CUDA_BIN", f"{CUDA_HOME}/bin")
-TORCH_CUDA_ARCH_LIST = os.environ.get("ARM_TORCH_CUDA_ARCH_LIST", "9.0")
+
+
+def _detect_arch_list():
+    """Ask the driver for the GPUs' compute capability instead of assuming one.
+
+    base_env exports TORCH_CUDA_ARCH_LIST into every subprocess, and kernel_runner treats the
+    env as authoritative over its own detection — so a wrong value here compiles every generated
+    kernel for the wrong architecture. A cubin does not run across major versions: on a B200
+    (sm_100) the old hardcoded "9.0" would make every candidate fail to load, score 0.0, and
+    look exactly like a model that cannot write CUDA. Detection failing falls back to "9.0"
+    loudly; ARM_TORCH_CUDA_ARCH_LIST still overrides everything for cross-compiling setups.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=15)
+        caps = sorted({ln.strip() for ln in out.stdout.splitlines() if ln.strip()})
+        if out.returncode == 0 and caps and all(re.fullmatch(r"\d+\.\d+", c) for c in caps):
+            return ";".join(caps)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    print("[adapters] WARNING: could not detect GPU compute capability; "
+          "defaulting TORCH_CUDA_ARCH_LIST=9.0 — set ARM_TORCH_CUDA_ARCH_LIST if that is wrong",
+          flush=True)
+    return "9.0"
+
+
+TORCH_CUDA_ARCH_LIST = os.environ.get("ARM_TORCH_CUDA_ARCH_LIST") or _detect_arch_list()
 VENV_BIN = os.path.dirname(VENV_PY)
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -856,23 +883,51 @@ def per_category_from_log(offsets):
     """
     txt = _read_since(offsets)
     agg = {}
+    rowed = {}  # row-tagged task -> [(correct, speedup)]: one PARQUET ROW, however often scored
+    row_cat = {}
+
+    def _tally(cat, corrects, speedups):
+        a = agg.setdefault(cat, {"n": 0, "n_correct": 0, "speedups": []})
+        a["n"] += 1
+        a["n_correct"] += sum(corrects) / len(corrects)
+        if speedups:
+            a["speedups"].append(sum(speedups) / len(speedups))
+
     for m in REWARD_LINE.finditer(txt):
-        correct, speedup, _ds, _task, level, category, _reward = m.groups()
+        correct, speedup, _ds, task, level, category, _reward = m.groups()
         cat = cat_of_level(level, category)
         if cat is None:
             continue
-        a = agg.setdefault(cat, {"n": 0, "n_correct": 0, "speedups": []})
-        a["n"] += 1
+        if task and _ROW_MARK in task:
+            # Collect, don't count: verl pads validation batches by repeating rows
+            # (ray_trainer.py:596) and the repeats are scored too. Same id = same row; its
+            # observations average into ONE sample below, so a padded repeat cannot double-weight
+            # its row, and disagreeing observations (greedy re-bench timing) split the difference.
+            rowed.setdefault(task, []).append((correct, speedup))
+            row_cat[task] = cat
+            continue
+        sp = []
         if correct == "1":
-            a["n_correct"] += 1
             try:
-                a["speedups"].append(float(speedup))
+                sp.append(float(speedup))
             except ValueError:
                 pass
+        _tally(cat, [int(correct == "1")], sp)
+
+    for task, obs in rowed.items():
+        sps = []
+        for c, s in obs:
+            if c == "1":
+                try:
+                    sps.append(float(s))
+                except ValueError:
+                    pass
+        _tally(row_cat[task], [int(c == "1") for c, _ in obs], sps)
+
     out = {}
     for cat, a in agg.items():
         sp = sorted(a["speedups"])
-        out[cat] = {"n": a["n"], "n_correct": a["n_correct"],
+        out[cat] = {"n": a["n"], "n_correct": round(a["n_correct"], 3),
                     "correct_rate": round(a["n_correct"] / a["n"], 4) if a["n"] else 0.0,
                     "speedup_median": round(sp[len(sp) // 2], 3) if sp else None,
                     "n_faster_than_torch": sum(1 for s in sp if s > 1.0)}
@@ -1082,6 +1137,15 @@ def signals_adapter(checkpoint, scaffold, cfg, seed):
 # Chosen because no category or task_name contains it.
 _ARM_SEP = "@@"
 
+# Marks a task_name as belonging to ONE PARQUET ROW of a measurement pass ("name#r17@@arm").
+# ray_trainer.py:596 pads every validation batch to a multiple of rollout.agent.num_workers by
+# repeating rows; the repeats are generated AND scored (their reward lines hit the worker logs)
+# and only their tensors are dropped by unpad. With 8 workers and 36-row waves that was 4 phantom
+# lines per wave — 60 of 540 in the first smoke A/B, n reported as 199/200/201 per 180-row arm.
+# A row id makes the phantom detectable at parse time: the same id seen twice is one row scored
+# twice, whereas legitimate repeat copies (ab_repeats_max) are distinct rows with distinct ids.
+_ROW_MARK = "#r"
+
 
 def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
     """Three-way A/B — bare vs the live scaffold vs the proposal — in ONE generation pass.
@@ -1174,8 +1238,12 @@ def measure_ab_adapter(checkpoint, current, candidate, tasks, cfg, seed):
             e["category"] = f"{cat}{_ARM_SEP}{arm}"
             # task_name is what per_instance_from_log aggregates on; keep the arms apart there too
             # so a task appearing three times is not read as one instance tried three times.
+            # The row id (see _ROW_MARK) additionally keeps verl's batch padding apart from
+            # ab_repeats_max copies: a padded repeat reprints an EXISTING id, a copy gets its own.
+            # Rows without a task_name can't be tagged and keep legacy line counting — the Triton
+            # set names every row; only the CudaForge scratch half would be affected.
             if e.get("task_name"):
-                e["task_name"] = f"{e['task_name']}{_ARM_SEP}{arm}"
+                e["task_name"] = f"{e['task_name']}{_ROW_MARK}{len(rows)}{_ARM_SEP}{arm}"
             rows.append(e)
         df["extra_info"] = rows
         frames.append(df)
