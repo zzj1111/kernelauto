@@ -453,6 +453,11 @@ def eval_adapter(checkpoint, val_n, cfg):
         env["VLLM_SEED"] = str(d)
         off = worker_log_offsets(cfg)
         cmd = _train_cmd(cfg, tagged_val, step, val_before=True, test_freq=1)
+        # val_only evaluates data.val_files, not the train_file slot — point it at the
+        # tagged copy THIS pass built (same idiom as measure_ab below). Without this the
+        # eval scores whatever cfg['val_file'] happens to be; it only ever worked when a
+        # stale tagged file sat at that path, and a fresh pod (B200, step 70) broke it.
+        cmd = cmd.replace(f"data.val_files={cfg['val_file']}", f"data.val_files={tagged_val}")
         _run(cmd + " trainer.val_only=True", elog, env)
         sr, per = parse_val(elog)
         # parse_val keys on verl's data_source, and this dataset has ONE of those — a breakdown
@@ -533,6 +538,9 @@ def _eval_merged(checkpoint, step, val_n, cfg):
     env["VLLM_SEED"] = str(cfg.get("base_seed", 0) + step)
     off = worker_log_offsets(cfg)
     cmd = _train_cmd(cfg, merged, step, val_before=True, test_freq=1)
+    # Same fix as the per-draw eval above: the merged multi-draw parquet must BE the
+    # validation set, not ride along in the train_files slot where val_only ignores it.
+    cmd = cmd.replace(f"data.val_files={cfg['val_file']}", f"data.val_files={merged}")
     _run(cmd + " trainer.val_only=True", elog, env)
 
     by_key = per_category_from_log(off)
