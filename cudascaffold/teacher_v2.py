@@ -15,8 +15,11 @@ import sys
 from . import observation as O
 from . import teacher as T1
 
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEACHERFLOW_PATH = os.environ.get(
-    "TEACHERFLOW_PATH", os.path.join(os.path.expanduser("~"), "teacherflow"))
+    "TEACHERFLOW_PATH",
+    _REPO if os.path.isdir(os.path.join(_REPO, "teacherflow")) else
+    os.path.join(os.path.expanduser("~"), "teacherflow"))
 
 
 def _client():
