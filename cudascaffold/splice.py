@@ -216,7 +216,17 @@ def build(src_parquet, dst_parquet, scaffold, seed=0, mode="full"):
             n_inj += 1
             stat[0] += 1
         out.append(p)
+        # carry the injection flag WITH the row: the reward function is the only place that
+        # sees every candidate, so this is how the recorder learns which side a group was on
+        # (extra_info may be a dict or a JSON string depending on the dump; write back same shape)
+        try:
+            d_ = _as_dict(ei)
+            d_["injected"] = bool(fire)
+            extras[i] = d_ if isinstance(ei, dict) else json.dumps(d_)
+        except Exception:
+            pass
     df["prompt"] = out
+    df["extra_info"] = extras
     os.makedirs(os.path.dirname(os.path.abspath(dst_parquet)), exist_ok=True)
     df.to_parquet(dst_parquet, index=False)
     # `fired` is RECORDED, never recomputed downstream. Injection needs TWO conditions — the coin

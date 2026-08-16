@@ -1464,6 +1464,27 @@ def _emit_attribution(data_source, extra_info, correctness, speedup, reward,
     line = (f"correctness: {correctness}, speedup: {speedup}, data_source:{data_source}, "
             f"task_name:{ei.get('task_name')}, level:{ei.get('level')}, "
             f"category:{ei.get('category')}, reward:{reward}")
+    # Structured recorder for the investigative Teacher (teacherflow kernel domain): one JSON
+    # row per scored candidate, beside the print the legacy controller scrapes. Off unless
+    # CUDASCAFFOLD_ROLLOUT_LOG is set; failures never affect the reward path.
+    _rl = os.environ.get("CUDASCAFFOLD_ROLLOUT_LOG")
+    if _rl:
+        try:
+            code = str(getattr(_RECORDER_CODE, "text", "") or "")
+            head, tail = 1500, 800
+            excerpt = code if len(code) <= head + tail else (
+                code[:head] + "\n...[middle truncated]...\n" + code[-tail:])
+            with open(_rl, "a") as _f:
+                _f.write(json.dumps({
+                    "task_name": ei.get("task_name"), "category": ei.get("category"),
+                    "level": ei.get("level"), "data_source": data_source,
+                    "injected": bool(ei.get("injected")),
+                    "correctness": int(correctness), "speedup": float(speedup or 0.0),
+                    "reward": float(reward or 0.0),
+                    "fail_kind": fail_kind, "fail_msg": " ".join(str(fail_msg or "").split())[:300],
+                    "code": excerpt}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
     # `fail:` / `err:` ride at the END so REWARD_LINE's existing groups are untouched; the
     # controller reads them with a separate tail regex. One flattened line, bounded length —
     # this is the Teacher's only view of WHY a candidate scored 0. `err` consumes the rest of
@@ -1480,6 +1501,10 @@ def _emit_attribution(data_source, extra_info, correctness, speedup, reward,
     print(line)
 
 
+import threading as _threading
+_RECORDER_CODE = _threading.local()   # per-thread solution_str for the JSONL recorder
+
+
 def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     """
     Final reward:
@@ -1488,6 +1513,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
       - major_hacking => 0
       - else shaped bench reward
     """
+    _RECORDER_CODE.text = solution_str
     if extra_info is None or "answer" not in extra_info:
         # Attributed like every other outcome. Returning silently here made these candidates
         # invisible to the Teacher: the controller learns what happened only from this line.

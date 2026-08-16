@@ -192,6 +192,13 @@ def build_fns(cfg):
         return T.propose(obs, call_fn=T.openai_call, domain=cfg["domain"],
                          priors=cfg["teacher_priors"], scaffold=scaffold)
 
+    # v2: the investigative Teacher (teacherflow kernel domain) — same decision grammar
+    # and normalize() validation, different acquisition: budgeted read-only tools over the
+    # cycle's scored candidates (recorder), transcript persisted per cycle.
+    if os.environ.get("AUTOSCAFFOLD_TEACHER") == "v2":
+        from . import teacher_v2 as T2
+        teacher_fn = T2.make_teacher_fn(cfg)
+
     def triage_fn(obs):
         return T.triage(obs, call_fn=T.openai_call)
 

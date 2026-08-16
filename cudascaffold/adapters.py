@@ -100,6 +100,9 @@ def base_env(cfg):
     env["RUBRIC_VLLM_URL"] = cfg["rubric_url"]
     env["RUBRIC_MODEL_NAME"] = cfg["rubric_model"]
     env["RUBRIC_VLLM_TIMEOUT_SEC"] = str(cfg.get("rubric_timeout", 120))
+    # structured per-candidate recorder for the investigative Teacher (teacherflow kernel
+    # domain); the legacy log-scraping controller keeps working regardless
+    env["CUDASCAFFOLD_ROLLOUT_LOG"] = os.path.join(cfg["work"], "rollouts.jsonl")
     if os.environ.get("ARM_WANDB") != "0":
         has_cred = bool(os.environ.get("WANDB_API_KEY")) or \
             os.path.exists(os.path.expanduser("~/.netrc"))
